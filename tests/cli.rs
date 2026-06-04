@@ -70,6 +70,39 @@ fn txt_detect_writes_markdown() {
 }
 
 #[test]
+fn detect_writes_crawlable_snippet_map() {
+    let dir = work_dir("crawl_map");
+    let input = dir.join("contract.txt");
+    let out = dir.join("contract.stencil.md");
+    fs::write(&input, "Pay [Buyer Name] the deposit of [Amount].").expect("seed input");
+
+    let output = run(&[
+        "detect",
+        input.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "detect should succeed");
+
+    let md = fs::read_to_string(&out).expect("read output md");
+    // A top-level index enumerates the snippet file with an ID and a relative link.
+    assert!(md.contains("## Snippet index"), "top index present");
+    assert!(md.contains("[snippets/pay-buyer-name-the-deposit-of-amount.md](snippets/pay-buyer-name-the-deposit-of-amount.md)"));
+    // The inventory row shares that ID (both brackets are in block 0 → one file, S1).
+    assert!(md.contains("| S1 |"), "inventory row carries the shared ID");
+
+    // The snippet file links back up to the main inventory, closing the crawl loop.
+    let snippet = dir
+        .join("snippets")
+        .join("pay-buyer-name-the-deposit-of-amount.md");
+    let snippet_md = fs::read_to_string(&snippet).expect("read snippet file");
+    assert!(snippet_md.contains("# S1 — snippet, block 0"));
+    assert!(snippet_md.contains("[`../contract.stencil.md`](../contract.stencil.md)"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn txt_censor_writes_mapping_and_placeholders() {
     let dir = work_dir("txt_censor");
     let input = dir.join("contract.txt");

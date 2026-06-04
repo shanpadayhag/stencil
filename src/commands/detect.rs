@@ -18,11 +18,11 @@ use std::collections::BTreeSet;
 
 use crate::censor::{CensorOptions, PartyList, censor};
 use crate::cli::DetectArgs;
-use crate::detect::detect;
+use crate::detect::{Detection, Status, detect};
 use crate::extract;
 use crate::learn::{self, LearnedStore};
 use crate::model::{Document, Mapping};
-use crate::render::render;
+use crate::render::{SnippetEntry, render};
 use crate::review::{self, ReviewFile};
 use crate::section::sections;
 
@@ -53,8 +53,6 @@ pub fn run(args: DetectArgs) -> Result<()> {
     // Censor the cross-paragraph rows' preview text before they reach the inventory, so
     // the main file never dumps a raw multi-paragraph span into the table.
     review::censor_cross_paragraph_previews(&mut detection, &extracted, &review_options);
-    let secs = sections(&document, &detection);
-    let markdown = render(&document.source, &secs);
 
     let out_path = args
         .out
@@ -65,10 +63,24 @@ pub fn run(args: DetectArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| sibling_path(&args.input, ".mapping.json"));
 
-    // Review files are built from the uncensored source so censoring runs cleanly here.
+    // Build the snippet files first: they assign the stable IDs and paths the main-file
+    // inventory links to. Built from the uncensored source so censoring runs cleanly here.
     let review_dir = review_dir(&out_path);
-    let review_files =
-        review::build_review_files(&extracted, &detection, &review_options, &review_dir);
+    let main_md_name = out_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("stencil.md");
+    let review_files = review::build_review_files(
+        &extracted,
+        &detection,
+        &review_options,
+        &review_dir,
+        main_md_name,
+    );
+    let snippet_entries = build_snippet_entries(&review_files, &detection);
+
+    let secs = sections(&document, &detection);
+    let markdown = render(&document.source, &secs, &snippet_entries);
 
     // Pre-check every target so we never write some then fail on another.
     super::ensure_writable(&out_path, args.force)?;
@@ -134,6 +146,47 @@ fn load_allowed_values(data_dir: Option<&Path>) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+/// Assemble the snippet map the renderer links from: one [`SnippetEntry`] per review file,
+/// with its relative link and a review flag set when any bracket in its range is guessed.
+fn build_snippet_entries(review_files: &[ReviewFile], detection: &Detection) -> Vec<SnippetEntry> {
+    review_files
+        .iter()
+        .map(|file| SnippetEntry {
+            id: file.id.clone(),
+            range: file.range,
+            rel_path: relative_snippet_link(&file.path),
+            needs_review: detection
+                .hits
+                .iter()
+                .filter(|hit| (hit.block, hit.end_block) == file.range)
+                .any(|hit| hit.status == Status::Guessed),
+        })
+        .collect()
+}
+
+/// The snippet file's link relative to the main `.stencil.md` (its sibling): the path from
+/// the `snippets/` component onward (e.g. `snippets/cross-paragraph/foo.md`), with forward
+/// slashes so the Markdown link is portable.
+fn relative_snippet_link(path: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut found = false;
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            found |= name == "snippets";
+            if found {
+                parts.push(name.to_string_lossy().into_owned());
+            }
+        }
+    }
+    if parts.is_empty() {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        parts.join("/")
+    }
+}
+
 /// The directory for per-bracket snippet files: a `snippets/` folder beside the main
 /// output file (with a `cross-paragraph/` subfolder for ambiguous spans).
 fn review_dir(out_path: &Path) -> PathBuf {
@@ -177,6 +230,18 @@ fn write_mapping(path: &Path, mapping: &Mapping) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_snippet_link_starts_at_snippets_component() {
+        assert_eq!(
+            relative_snippet_link(Path::new("/tmp/out/snippets/foo.md")),
+            "snippets/foo.md"
+        );
+        assert_eq!(
+            relative_snippet_link(Path::new("/tmp/out/snippets/cross-paragraph/bar.md")),
+            "snippets/cross-paragraph/bar.md"
+        );
+    }
 
     #[test]
     fn sibling_path_uses_stem_beside_input() {

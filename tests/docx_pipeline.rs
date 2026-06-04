@@ -46,7 +46,9 @@ fn docx_detect_pipeline_preserves_headings_and_tables() {
 
     let document = extract::from_path(&path).expect("extract docx");
     let detection = detect(&document);
-    let markdown = render(&document.source, &sections(&document, &detection));
+    // Rendering the map links requires the command's review files; here we exercise the
+    // pipeline shape, so no snippet entries are supplied.
+    let markdown = render(&document.source, &sections(&document, &detection), &[]);
 
     let _ = fs::remove_file(&path);
 
