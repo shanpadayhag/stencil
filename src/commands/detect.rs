@@ -39,7 +39,7 @@ pub fn run(args: DetectArgs) -> Result<()> {
     };
     // Values the user has previously marked safe (via interactive restore) are skipped by
     // censoring. Best-effort: a missing/unreadable store just means nothing is allowed yet.
-    let allowed = load_allowed_values();
+    let allowed = load_allowed_values(args.data_dir.as_deref());
     let (document, mapping) = maybe_censor(&extracted, &args, parties.as_ref(), &allowed);
 
     // Cross-paragraph artifacts are ALWAYS censored — using any party list plus the
@@ -127,8 +127,8 @@ fn maybe_censor(
 }
 
 /// Load the per-user learned allowlist, or an empty set if it cannot be located/read.
-fn load_allowed_values() -> BTreeSet<String> {
-    learn::store_path()
+fn load_allowed_values(data_dir: Option<&Path>) -> BTreeSet<String> {
+    learn::store_path(data_dir)
         .and_then(|path| LearnedStore::load(&path))
         .map(|store| store.allowed_values())
         .unwrap_or_default()

@@ -83,7 +83,8 @@ pub fn select<'a>(mapping: &'a Mapping, input: &str) -> Result<Vec<Decision<'a>>
         "Review each value — [space] skip · [enter] restore · [q] quit & save",
     )?;
     for (index, entry) in present.iter().enumerate() {
-        prompt(&mut out, index + 1, total, entry)?;
+        let context = crate::learn::sentence_window(input, &entry.placeholder);
+        prompt(&mut out, index + 1, total, entry, &context)?;
         match review_one()? {
             Action::Restore => {
                 decisions.push(Decision { entry, allow: true });
@@ -125,8 +126,15 @@ fn review_one() -> Result<Action> {
     }
 }
 
-/// Print the prompt block for one placeholder.
-fn prompt(out: &mut impl Write, index: usize, total: usize, entry: &MappingEntry) -> Result<()> {
+/// Print the prompt block for one placeholder, including a sentence of surrounding
+/// (already-censored) context so the user can judge whether the value is sensitive *here*.
+fn prompt(
+    out: &mut impl Write,
+    index: usize,
+    total: usize,
+    entry: &MappingEntry,
+    context: &str,
+) -> Result<()> {
     write_line(out, "")?;
     write_line(
         out,
@@ -136,6 +144,9 @@ fn prompt(out: &mut impl Write, index: usize, total: usize, entry: &MappingEntry
         ),
     )?;
     write_line(out, &format!("   value: {}", entry.value))?;
+    if !context.is_empty() {
+        write_line(out, &format!("   context: {context}"))?;
+    }
     Ok(())
 }
 

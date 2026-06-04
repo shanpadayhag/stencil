@@ -24,7 +24,12 @@ pub fn run(args: RestoreArgs) -> Result<()> {
 
     let selected: Vec<&MappingEntry> = if args.interactive {
         let decisions = interactive::select(&mapping, &input)?;
-        learn_from_decisions(&decisions, &mapping.source, &input);
+        learn_from_decisions(
+            &decisions,
+            &mapping.source,
+            &input,
+            args.data_dir.as_deref(),
+        );
         decisions
             .iter()
             .filter(|decision| decision.allow)
@@ -53,12 +58,18 @@ pub fn run(args: RestoreArgs) -> Result<()> {
 /// Persist the interactive-restore decisions: append each to the JSONL training log and
 /// fold it into the per-user learned store. Best-effort — a storage hiccup must never
 /// fail the restore the user just completed, so problems are reported, not propagated.
-fn learn_from_decisions(decisions: &[interactive::Decision<'_>], source: &str, input: &str) {
+fn learn_from_decisions(
+    decisions: &[interactive::Decision<'_>],
+    source: &str,
+    input: &str,
+    data_dir: Option<&Path>,
+) {
     if decisions.is_empty() {
         return;
     }
-    let (Ok(store_path), Ok(log_path)) = (learn::store_path(), learn::log_path()) else {
-        eprintln!("note: could not locate the config dir; decisions were not learned");
+    let (Ok(store_path), Ok(log_path)) = (learn::store_path(data_dir), learn::log_path(data_dir))
+    else {
+        eprintln!("note: could not locate the data dir; decisions were not learned");
         return;
     };
 
@@ -66,13 +77,15 @@ fn learn_from_decisions(decisions: &[interactive::Decision<'_>], source: &str, i
     for decision in decisions {
         let entry = decision.entry;
         let record = DecisionRecord {
+            schema: learn::decision_schema(),
             timestamp: learn::now_epoch_secs(),
             source: source.to_string(),
             placeholder: entry.placeholder.clone(),
             value_type: entry.value_type.clone(),
             value: entry.value.clone(),
             decision: if decision.allow { "allow" } else { "deny" }.to_string(),
-            context: learn::context_window(input, &entry.placeholder),
+            shown_context: learn::sentence_window(input, &entry.placeholder),
+            block_context: learn::block_window(input, &entry.placeholder),
         };
         if let Err(err) = learn::append_decision(&log_path, &record) {
             eprintln!("note: could not log a decision: {err}");

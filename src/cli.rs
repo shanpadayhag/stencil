@@ -55,6 +55,11 @@ pub struct DetectArgs {
     #[arg(long)]
     pub map: Option<PathBuf>,
 
+    /// Directory holding the learning artifacts (`learned.json` + `decisions.jsonl`).
+    /// Overrides `STENCIL_DATA_DIR`; default `$XDG_CONFIG_HOME/stencil` or `~/.config/stencil`.
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
+
     /// Overwrite existing output/mapping files instead of refusing.
     #[arg(long)]
     pub force: bool,
@@ -82,6 +87,11 @@ pub struct RestoreArgs {
     /// Restored output (default: `<input>.restored.<ext>`).
     #[arg(long)]
     pub out: Option<PathBuf>,
+
+    /// Directory holding the learning artifacts (`learned.json` + `decisions.jsonl`).
+    /// Overrides `STENCIL_DATA_DIR`; default `$XDG_CONFIG_HOME/stencil` or `~/.config/stencil`.
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
 
     /// Overwrite an existing output file instead of refusing.
     #[arg(long)]
