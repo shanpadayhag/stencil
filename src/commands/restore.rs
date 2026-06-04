@@ -32,11 +32,6 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         "Restored {replaced} placeholder occurrence(s) to {}",
         out_path.display()
     );
-
-    let leftover = count_leftover(&restored);
-    if leftover > 0 {
-        eprintln!("⚠ {leftover} REDACTED_* token(s) had no mapping entry and were left as-is");
-    }
     Ok(())
 }
 
@@ -72,11 +67,6 @@ fn apply(mapping: &Mapping, text: &str) -> (String, usize) {
         }
     }
     (result, replaced)
-}
-
-/// Count residual `REDACTED_` tokens (placeholders with no mapping entry).
-fn count_leftover(text: &str) -> usize {
-    text.matches("REDACTED_").count()
 }
 
 /// Default restored path: `<stem>.restored.<ext>` beside the input.
@@ -126,12 +116,14 @@ mod tests {
     }
 
     #[test]
-    fn leaves_unmapped_tokens_and_counts_them() {
+    fn leaves_unmapped_tokens_uncounted() {
         let map = mapping(vec![("REDACTED_PERSON_001", "Jane")]);
         let (out, n) = apply(&map, "REDACTED_PERSON_001 and REDACTED_ORG_009");
-        assert_eq!(n, 1);
-        assert_eq!(count_leftover(&out), 1);
-        assert!(out.contains("REDACTED_ORG_009"));
+        assert_eq!(n, 1, "only the mapped placeholder is replaced");
+        assert!(
+            out.contains("REDACTED_ORG_009"),
+            "the unmapped token is left as-is"
+        );
     }
 
     #[test]
@@ -165,7 +157,10 @@ mod tests {
 
         let (restored, _) = apply(&outcome.mapping, &censored_text);
         assert_eq!(restored, original);
-        assert_eq!(count_leftover(&restored), 0);
+        assert!(
+            !restored.contains("REDACTED_"),
+            "no placeholders should remain"
+        );
     }
 
     #[test]

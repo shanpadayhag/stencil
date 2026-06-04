@@ -10,6 +10,7 @@
 //! - [`detect`] — find bracketed variables and tally bracket balance
 //! - [`section`] — slice the document into heading-delimited sections
 //! - [`render`] — emit the per-section Markdown
+//! - [`review`] — write per-candidate censored files for cross-paragraph spans
 //! - [`commands`] — orchestrate the above for each subcommand
 #![forbid(unsafe_code)]
 
@@ -20,6 +21,7 @@ pub mod detect;
 pub mod extract;
 pub mod model;
 pub mod render;
+pub mod review;
 pub mod section;
 
 use anyhow::Result;

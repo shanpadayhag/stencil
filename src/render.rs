@@ -248,6 +248,20 @@ mod tests {
     }
 
     #[test]
+    fn cross_paragraph_span_is_inventoried_and_flagged() {
+        let md = render_doc(vec![
+            Block::Paragraph {
+                text: "[If the buyer defaults".into(),
+            },
+            Block::Paragraph {
+                text: "the deposit is forfeited]".into(),
+            },
+        ]);
+        assert!(md.contains("paired (cross-paragraph)"));
+        assert!(md.contains("⚠ GUESSED"));
+    }
+
+    #[test]
     fn table_renders_as_markdown_grid() {
         let md = render_doc(vec![Block::Table {
             rows: vec![

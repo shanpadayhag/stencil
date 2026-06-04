@@ -18,6 +18,13 @@ use crate::model::{Block, Document};
 /// condition). Tunable; advisory only — it never changes detection, just labelling.
 pub const LONG_BRACKET_THRESHOLD: usize = 120;
 
+/// Maximum number of blocks a single cross-paragraph span may cover (the opening
+/// block, the closing block, and any in between). A `[` only pairs with a `]` in a
+/// later block when the span stays within this many blocks; beyond it the brackets
+/// stay lone. Bounds the blast radius of a stray `[` — especially in heading-less
+/// `.txt`, where the heading-boundary stop does not apply.
+pub const MAX_CROSS_BLOCK_SPAN: usize = 5;
+
 /// What kind of bracket a [`BracketHit`] represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BracketKind {
@@ -25,6 +32,10 @@ pub enum BracketKind {
     Paired,
     /// A matched pair whose span exceeds [`LONG_BRACKET_THRESHOLD`].
     PairedLong,
+    /// A `[` paired with a `]` in a *later* block (the span crosses paragraph
+    /// boundaries). Always flagged for human review — cross-paragraph pairing is
+    /// genuinely ambiguous, so it is never treated as confident.
+    PairedCrossParagraph,
     /// An unmatched `[` (guessed span to end of line).
     LoneOpen,
     /// An unmatched `]` (guessed span from start of line).
@@ -37,14 +48,19 @@ impl BracketKind {
         match self {
             BracketKind::Paired => "paired",
             BracketKind::PairedLong => "paired (long)",
+            BracketKind::PairedCrossParagraph => "paired (cross-paragraph)",
             BracketKind::LoneOpen => "lone `[`",
             BracketKind::LoneClose => "lone `]`",
         }
     }
 
-    /// Whether this kind is a confidently-paired bracket.
+    /// Whether this kind is a matched `[...]` pair (single-block or cross-paragraph),
+    /// as opposed to a lone, unmatched bracket.
     pub fn is_paired(self) -> bool {
-        matches!(self, BracketKind::Paired | BracketKind::PairedLong)
+        matches!(
+            self,
+            BracketKind::Paired | BracketKind::PairedLong | BracketKind::PairedCrossParagraph
+        )
     }
 }
 
@@ -64,12 +80,19 @@ pub struct BracketHit {
     pub kind: BracketKind,
     /// Confidence in the hit.
     pub status: Status,
-    /// The bracketed text, brackets included (the guessed span for lone brackets).
+    /// The bracketed text, brackets included (the guessed span for lone brackets). For
+    /// a cross-paragraph pair this is the full span joined across blocks (paragraphs
+    /// separated by a blank line).
     pub span_text: String,
-    /// Index of the block this hit was found in.
+    /// Index of the block where the span starts (the `[`).
     pub block: usize,
-    /// Byte offset of the span start within that block's text.
+    /// Byte offset of the span start within `block`'s text.
     pub start: usize,
+    /// Index of the block where the span ends (the `]`). Equal to `block` for every
+    /// hit except a [`BracketKind::PairedCrossParagraph`], which ends in a later block.
+    pub end_block: usize,
+    /// Byte offset just past the span end within `end_block`'s text.
+    pub end: usize,
 }
 
 /// Tally of raw `[` and `]` occurrences across a document.
@@ -127,7 +150,125 @@ pub fn detect(document: &Document) -> Detection {
             scan_text(text, block_index, &mut detection);
         }
     }
+    pair_across_blocks(document, &mut detection);
     detection
+}
+
+/// Second pass: pair a lone `[` with a lone `]` in a *later* block, forming a
+/// cross-paragraph span.
+///
+/// Lone brackets are matched greedily nearest-first, mirroring the single-block rule.
+/// A pair is only formed when every block in the inclusive range is a
+/// [`Block::Paragraph`] (the heading-boundary stop, which also excludes tables) and the
+/// span covers at most [`MAX_CROSS_BLOCK_SPAN`] blocks. Formed pairs are always flagged
+/// for review; brackets that cannot pair stay lone.
+fn pair_across_blocks(document: &Document, detection: &mut Detection) {
+    // `detection.hits` is in document order (blocks ascending, sorted within a block),
+    // so a single stack pass pairs each `]` with the nearest unmatched earlier `[`.
+    let mut open_stack: Vec<usize> = Vec::new();
+    let mut consumed = vec![false; detection.hits.len()];
+    let mut pairs: Vec<BracketHit> = Vec::new();
+
+    for index in 0..detection.hits.len() {
+        match detection.hits[index].kind {
+            BracketKind::LoneOpen => open_stack.push(index),
+            BracketKind::LoneClose => {
+                // No open to pair with: this `]` stays lone.
+                let Some(open_index) = open_stack.pop() else {
+                    continue;
+                };
+                if let Some(span) = cross_block_span(
+                    document,
+                    &detection.hits[open_index],
+                    &detection.hits[index],
+                ) {
+                    consumed[open_index] = true;
+                    consumed[index] = true;
+                    pairs.push(span);
+                }
+                // Not pairable: both stay lone. The popped `[` is not requeued — any
+                // earlier `[` is even farther away, so it could not pair here either.
+            }
+            _ => {}
+        }
+    }
+
+    if pairs.is_empty() {
+        return;
+    }
+
+    let mut kept: Vec<BracketHit> = std::mem::take(&mut detection.hits)
+        .into_iter()
+        .zip(consumed)
+        .filter_map(|(hit, gone)| (!gone).then_some(hit))
+        .collect();
+    kept.append(&mut pairs);
+    kept.sort_by_key(|hit| (hit.block, hit.start));
+    detection.hits = kept;
+}
+
+/// Build a cross-paragraph hit from a lone `[` and a lone `]`, or `None` if the pair is
+/// disallowed (closing bracket not in a later block, a non-paragraph block in the way,
+/// or the span exceeds [`MAX_CROSS_BLOCK_SPAN`] blocks).
+fn cross_block_span(
+    document: &Document,
+    open: &BracketHit,
+    close: &BracketHit,
+) -> Option<BracketHit> {
+    let (start_block, end_block) = (open.block, close.end_block);
+    if end_block <= start_block || end_block - start_block + 1 > MAX_CROSS_BLOCK_SPAN {
+        return None;
+    }
+    let all_paragraphs = (start_block..=end_block)
+        .all(|index| matches!(document.blocks.get(index), Some(Block::Paragraph { .. })));
+    if !all_paragraphs {
+        return None;
+    }
+
+    Some(BracketHit {
+        kind: BracketKind::PairedCrossParagraph,
+        status: Status::Guessed,
+        span_text: join_blocks(document, start_block, open.start, end_block, close.end),
+        block: start_block,
+        start: open.start,
+        end_block,
+        end: close.end,
+    })
+}
+
+/// Join a span's text across paragraph blocks: the opening block from `start`, whole
+/// middle blocks, and the closing block up to `end`, separated by blank lines.
+fn join_blocks(
+    document: &Document,
+    start_block: usize,
+    start: usize,
+    end_block: usize,
+    end: usize,
+) -> String {
+    let mut out = String::new();
+    for index in start_block..=end_block {
+        let text = paragraph_text(document, index);
+        let slice = if index == start_block {
+            &text[start..]
+        } else if index == end_block {
+            &text[..end]
+        } else {
+            text
+        };
+        if index != start_block {
+            out.push_str("\n\n");
+        }
+        out.push_str(slice);
+    }
+    out
+}
+
+/// The text of a paragraph block, or `""` if absent or not a paragraph.
+fn paragraph_text(document: &Document, index: usize) -> &str {
+    match document.blocks.get(index) {
+        Some(Block::Paragraph { text }) => text.as_str(),
+        _ => "",
+    }
 }
 
 /// Byte ranges of **paired** bracket spans in a single text field.
@@ -219,6 +360,8 @@ fn paired_hit(text: &str, block: usize, start: usize, end: usize) -> BracketHit 
         span_text: span.to_string(),
         block,
         start,
+        end_block: block,
+        end,
     }
 }
 
@@ -230,6 +373,8 @@ fn lone_hit(kind: BracketKind, text: &str, block: usize, start: usize, end: usiz
         span_text: text[start..end].to_string(),
         block,
         start,
+        end_block: block,
+        end,
     }
 }
 
@@ -379,5 +524,110 @@ mod tests {
         assert_eq!(result.balance.open, 3);
         assert_eq!(result.balance.close, 2);
         assert!(!result.balance.is_balanced());
+    }
+
+    #[test]
+    fn cross_paragraph_pair_is_one_flagged_hit() {
+        let result = detect(&doc(vec![
+            para("[If the buyer defaults"),
+            para("all deposits are forfeited"),
+            para("and the contract ends]"),
+        ]));
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "the two lone brackets become one span"
+        );
+        let hit = &result.hits[0];
+        assert_eq!(hit.kind, BracketKind::PairedCrossParagraph);
+        assert_eq!(hit.status, Status::Guessed);
+        assert_eq!(hit.block, 0);
+        assert_eq!(hit.end_block, 2);
+        // The whole span, including the middle paragraph, is captured.
+        assert!(hit.span_text.contains("If the buyer defaults"));
+        assert!(hit.span_text.contains("all deposits are forfeited"));
+        assert!(hit.span_text.contains("and the contract ends]"));
+    }
+
+    #[test]
+    fn cross_paragraph_does_not_pair_across_a_heading() {
+        let result = detect(&doc(vec![
+            para("clause opens [here"),
+            Block::Heading {
+                level: 1,
+                text: "New Section".into(),
+            },
+            para("and closes ] there"),
+        ]));
+        // No pairing across the heading: both brackets stay lone guesses.
+        assert_eq!(result.hits.len(), 2);
+        assert!(result.hits.iter().all(|hit| hit.status == Status::Guessed));
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|hit| hit.kind != BracketKind::PairedCrossParagraph)
+        );
+    }
+
+    #[test]
+    fn cross_paragraph_respects_block_span_cap() {
+        // Open in block 0, close in block 5 → span of 6 blocks > MAX_CROSS_BLOCK_SPAN.
+        let mut blocks = vec![para("opens [here")];
+        for _ in 0..4 {
+            blocks.push(para("filler paragraph"));
+        }
+        blocks.push(para("closes ] here"));
+        assert_eq!(blocks.len(), MAX_CROSS_BLOCK_SPAN + 1);
+
+        let result = detect(&doc(blocks));
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|hit| hit.kind != BracketKind::PairedCrossParagraph),
+            "a span beyond the cap must not pair"
+        );
+    }
+
+    #[test]
+    fn cross_paragraph_pairs_at_the_span_cap() {
+        // Open in block 0, close in the last allowed block → exactly the cap, pairs.
+        let mut blocks = vec![para("opens [here")];
+        for _ in 0..(MAX_CROSS_BLOCK_SPAN - 2) {
+            blocks.push(para("filler paragraph"));
+        }
+        blocks.push(para("closes ] here"));
+        assert_eq!(blocks.len(), MAX_CROSS_BLOCK_SPAN);
+
+        let result = detect(&doc(blocks));
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].kind, BracketKind::PairedCrossParagraph);
+        assert_eq!(result.hits[0].end_block, MAX_CROSS_BLOCK_SPAN - 1);
+    }
+
+    #[test]
+    fn single_block_pairs_are_unaffected_by_cross_pass() {
+        let result = detect(&doc(vec![para("Pay [Buyer Name] now."), para("Done.")]));
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].kind, BracketKind::Paired);
+        assert_eq!(result.hits[0].end_block, 0);
+    }
+
+    #[test]
+    fn cross_paragraph_does_not_pair_across_a_table() {
+        let result = detect(&doc(vec![
+            para("opens [here"),
+            Block::Table {
+                rows: vec![vec![Cell::new("a"), Cell::new("b")]],
+            },
+            para("closes ] here"),
+        ]));
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|hit| hit.kind != BracketKind::PairedCrossParagraph)
+        );
     }
 }

@@ -151,6 +151,74 @@ fn docx_detect_writes_markdown() {
 }
 
 #[test]
+fn cross_paragraph_span_writes_censored_review_file_and_is_quiet() {
+    // A dedicated work dir keeps the generated `cross-paragraph/` subfolder isolated.
+    let dir = std::env::temp_dir().join(format!("stencil_xpara_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create work dir");
+
+    let input = dir.join("contract.txt");
+    let out = dir.join("contract.stencil.md");
+    // `[` opens in the first paragraph, `]` closes in the second (blank line between).
+    fs::write(
+        &input,
+        "[if buyer billing@acme.example defaults\n\nthe deposit is forfeited]",
+    )
+    .expect("seed input");
+
+    let output = run(&[
+        "detect",
+        input.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "detect should succeed");
+
+    // Main output inventories the span and flags it for review.
+    let md = fs::read_to_string(&out).expect("read md");
+    assert!(md.contains("paired (cross-paragraph)"));
+    assert!(md.contains("⚠ GUESSED"));
+
+    // The cross-paragraph inventory row is censored even without --censor, so the table
+    // never dumps a raw value (the section body above it is a separate concern).
+    let row = md
+        .lines()
+        .find(|line| line.contains("paired (cross-paragraph)"))
+        .expect("cross-paragraph inventory row");
+    assert!(
+        row.contains("REDACTED_EMAIL_001"),
+        "row preview is censored"
+    );
+    assert!(
+        !row.contains("billing@acme.example"),
+        "inventory row must not leak the value"
+    );
+
+    // The review file is censored even though the main run had no --censor.
+    let review = dir
+        .join("cross-paragraph")
+        .join("if-buyer-redacted-email-001-defaults.md");
+    let review_md = fs::read_to_string(&review).expect("read review file");
+    assert!(review_md.contains("REDACTED_EMAIL_001"));
+    assert!(
+        !review_md.contains("billing@acme.example"),
+        "review file must be censored before sharing"
+    );
+
+    // Quiet on success: one stdout line, nothing on stderr.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.lines().count(), 1, "exactly one confirmation line");
+    assert!(stdout.contains("cross-paragraph review file"));
+    assert!(
+        output.stderr.is_empty(),
+        "no noisy diagnostics on success; got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn censor_then_restore_round_trips_via_cli() {
     let input = tmp("rt", "txt");
     let out = tmp("rt", "stencil.md");

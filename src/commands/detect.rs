@@ -4,8 +4,11 @@
 //! Pipeline: extract → (censor) → detect → section → render. When `--censor` is set,
 //! censoring runs first so the section context in the Markdown shows `REDACTED_*`
 //! placeholders rather than real values, and a `mapping.json` is written for `restore`.
+//!
+//! Any cross-paragraph bracket spans additionally get their own always-censored review
+//! file under a `cross-paragraph/` subfolder (see [`crate::review`]). On success the
+//! command prints a single confirmation line and nothing else.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,10 +16,11 @@ use anyhow::{Context, Result, bail};
 
 use crate::censor::{CensorOptions, PartyList, censor};
 use crate::cli::DetectArgs;
-use crate::detect::{Detection, detect};
+use crate::detect::detect;
 use crate::extract;
 use crate::model::{Document, Mapping};
 use crate::render::render;
+use crate::review::{self, ReviewFile};
 use crate::section::sections;
 
 /// Run the `detect` subcommand.
@@ -26,9 +30,23 @@ pub fn run(args: DetectArgs) -> Result<()> {
     }
 
     let extracted = extract::from_path(&args.input)?;
-    let (document, mapping) = maybe_censor(extracted, &args)?;
+    let parties = match &args.parties {
+        Some(spec) => Some(PartyList::parse(spec)?),
+        None => None,
+    };
+    let (document, mapping) = maybe_censor(&extracted, &args, parties.as_ref());
 
-    let detection = detect(&document);
+    // Cross-paragraph artifacts are ALWAYS censored — heuristic names on, plus any party
+    // list — so they are safe to share regardless of the main run's `--censor`.
+    let review_options = CensorOptions {
+        parties: parties.as_ref(),
+        guess_names: true,
+    };
+
+    let mut detection = detect(&document);
+    // Censor the cross-paragraph rows' preview text before they reach the inventory, so
+    // the main file never dumps a raw multi-paragraph span into the table.
+    review::censor_cross_paragraph_previews(&mut detection, &extracted, &review_options);
     let secs = sections(&document, &detection);
     let markdown = render(&document.source, &secs);
 
@@ -41,10 +59,18 @@ pub fn run(args: DetectArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| sibling_path(&args.input, ".mapping.json"));
 
-    // Pre-check both targets so we never write one then fail on the other.
+    // Review files are built from the uncensored source so censoring runs cleanly here.
+    let review_dir = review_dir(&out_path);
+    let review_files =
+        review::build_review_files(&extracted, &detection, &review_options, &review_dir);
+
+    // Pre-check every target so we never write some then fail on another.
     super::ensure_writable(&out_path, args.force)?;
     if mapping.is_some() {
         super::ensure_writable(&map_path, args.force)?;
+    }
+    for file in &review_files {
+        super::ensure_writable(&file.path, args.force)?;
     }
 
     fs::write(&out_path, &markdown)
@@ -52,43 +78,68 @@ pub fn run(args: DetectArgs) -> Result<()> {
     if let Some(mapping) = &mapping {
         write_mapping(&map_path, mapping)?;
     }
-
-    if let Some(mapping) = &mapping {
-        report_censorship(mapping);
-    }
-    report_brackets(&detection);
+    write_review_files(&review_dir, &review_files)?;
 
     let hit_sections = secs.iter().filter(|section| section.has_hits()).count();
-    println!(
-        "Wrote {} bracket(s) across {} section(s) to {}{}",
+    let mut summary = format!(
+        "Wrote {} bracket(s) across {} section(s) to {}",
         detection.hits.len(),
         hit_sections,
         out_path.display(),
-        match &mapping {
-            Some(_) => format!(" (mapping: {})", map_path.display()),
-            None => String::new(),
-        },
     );
+    if mapping.is_some() {
+        summary.push_str(&format!(" (mapping: {})", map_path.display()));
+    }
+    if !review_files.is_empty() {
+        summary.push_str(&format!(
+            " [{} cross-paragraph review file(s) in {}]",
+            review_files.len(),
+            review_dir.display()
+        ));
+    }
+    println!("{summary}");
     Ok(())
 }
 
 /// Apply censoring if requested, returning the (possibly rewritten) document and the
-/// mapping to persist.
-fn maybe_censor(document: Document, args: &DetectArgs) -> Result<(Document, Option<Mapping>)> {
+/// mapping to persist. Party names are parsed by the caller and passed in.
+fn maybe_censor(
+    document: &Document,
+    args: &DetectArgs,
+    parties: Option<&PartyList>,
+) -> (Document, Option<Mapping>) {
     if !args.censor {
-        return Ok((document, None));
+        return (document.clone(), None);
     }
-
-    let parties = match &args.parties {
-        Some(spec) => Some(PartyList::parse(spec)?),
-        None => None,
-    };
     let options = CensorOptions {
-        parties: parties.as_ref(),
+        parties,
         guess_names: args.guess_names,
     };
-    let outcome = censor(&document, &options);
-    Ok((outcome.document, Some(outcome.mapping)))
+    let outcome = censor(document, &options);
+    (outcome.document, Some(outcome.mapping))
+}
+
+/// The directory for per-candidate review files: a `cross-paragraph/` subfolder beside
+/// the main output file.
+fn review_dir(out_path: &Path) -> PathBuf {
+    out_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("cross-paragraph")
+}
+
+/// Create the review subfolder (when there is anything to write) and write each file.
+fn write_review_files(dir: &Path, files: &[ReviewFile]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(dir).with_context(|| format!("failed to create `{}`", dir.display()))?;
+    for file in files {
+        fs::write(&file.path, &file.content)
+            .with_context(|| format!("failed to write `{}`", file.path.display()))?;
+    }
+    Ok(())
 }
 
 /// Build a sibling path `<stem><suffix>` beside `input` (e.g. `contract.stencil.md`).
@@ -106,70 +157,6 @@ fn sibling_path(input: &Path, suffix: &str) -> PathBuf {
 fn write_mapping(path: &Path, mapping: &Mapping) -> Result<()> {
     let json = serde_json::to_string_pretty(mapping).context("failed to serialize mapping")?;
     fs::write(path, json).with_context(|| format!("failed to write `{}`", path.display()))
-}
-
-/// Print the censorship summary (per-type counts; heuristic guesses listed) to stderr.
-fn report_censorship(mapping: &Mapping) {
-    if mapping.entries.is_empty() {
-        eprintln!("censor: no sensitive values found");
-        return;
-    }
-
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for entry in &mapping.entries {
-        *counts.entry(entry.value_type.as_str()).or_insert(0) += 1;
-    }
-    eprintln!("censored {} distinct value(s):", mapping.entries.len());
-    for (value_type, count) in &counts {
-        eprintln!("    {value_type}: {count}");
-    }
-
-    let guessed: Vec<_> = mapping
-        .entries
-        .iter()
-        .filter(|entry| entry.method == "heuristic")
-        .collect();
-    if !guessed.is_empty() {
-        eprintln!(
-            "⚠ {} heuristic-guessed name(s) — verify these are real before sharing:",
-            guessed.len()
-        );
-        for entry in guessed {
-            eprintln!("    {} = {}", entry.placeholder, entry.value);
-        }
-    }
-}
-
-/// Print the bracket-balance diagnostic (and any guessed spans) to stderr.
-fn report_brackets(detection: &Detection) {
-    let balance = detection.balance;
-    if balance.is_balanced() {
-        eprintln!(
-            "bracket balance OK: {} '[' / {} ']'",
-            balance.open, balance.close
-        );
-    } else {
-        eprintln!(
-            "⚠ unbalanced brackets: {} '[' vs {} ']'",
-            balance.open, balance.close
-        );
-    }
-
-    let guessed: Vec<_> = detection.guessed().collect();
-    if !guessed.is_empty() {
-        eprintln!(
-            "⚠ {} guessed lone-bracket span(s) to review:",
-            guessed.len()
-        );
-        for hit in guessed {
-            eprintln!(
-                "    [block {}] {}: {}",
-                hit.block,
-                hit.kind.label(),
-                hit.span_text
-            );
-        }
-    }
 }
 
 #[cfg(test)]
