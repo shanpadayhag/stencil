@@ -46,6 +46,37 @@ lazy_regex!(
     r"(?:\b[0-9]{1,4}[/.\-][0-9]{1,2}[/.\-][0-9]{1,4}\b)|(?:\b[0-9]{1,2}\s+(?i:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s+[0-9]{2,4}\b)|(?:\b(?i:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+[0-9]{1,2},?\s+[0-9]{2,4}\b)"
 );
 
+/// The "common range" number words: units, teens, tens, and the
+/// hundred/thousand/million/billion scales. Rust's regex is leftmost-longest, so
+/// `nineteen` wins over `nine` regardless of alternation order.
+const NUMBER_WORD: &str = r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion)";
+
+/// A spelled-out number: one or more [`NUMBER_WORD`]s joined by spaces, hyphens, or
+/// `and` (e.g. `two hundred fifty thousand`, `twenty-five`).
+fn number_phrase() -> String {
+    format!(r"\b{NUMBER_WORD}(?:[ \t\-]+(?:and[ \t]+)?{NUMBER_WORD})*")
+}
+
+/// Spelled-out monetary amounts: a number phrase followed by a currency word. Numeric
+/// amounts are handled by [`struct@MONEY`]; this catches `two thousand dollars`.
+static MONEY_WORDS: LazyLock<Regex> = LazyLock::new(|| {
+    let pattern = format!(
+        r"(?i){}\s+(?:dollars?|euros?|pounds?|pesos?|cents?|usd|eur|gbp)\b",
+        number_phrase()
+    );
+    Regex::new(&pattern).expect("static regex `MONEY_WORDS` is valid")
+});
+
+/// Percentages: numeric (`10%`, `10.5 %`), spelled out (`ten percent`), or the combined
+/// `ten percent (10%)` form captured as a single span.
+static PERCENT: LazyLock<Regex> = LazyLock::new(|| {
+    let pattern = format!(
+        r"(?i)(?:{}\s+per ?cent(?:\s*\([^)]*%\s*\))?)|(?:\b[0-9][0-9,]*(?:\.[0-9]+)?\s?%)",
+        number_phrase()
+    );
+    Regex::new(&pattern).expect("static regex `PERCENT` is valid")
+});
+
 /// Lower and upper bounds on the digit count of a plausible phone number.
 const PHONE_MIN_DIGITS: usize = 7;
 const PHONE_MAX_DIGITS: usize = 15;
@@ -68,6 +99,8 @@ pub fn find_candidates(text: &str) -> Vec<PatternMatch> {
     push_all(&mut matches, &EMAIL, text, ValueType::Email);
     push_all(&mut matches, &IBAN, text, ValueType::Iban);
     push_all(&mut matches, &MONEY, text, ValueType::Money);
+    push_all(&mut matches, &MONEY_WORDS, text, ValueType::Money);
+    push_all(&mut matches, &PERCENT, text, ValueType::Percent);
     push_all(&mut matches, &DATE, text, ValueType::Date);
     push_all(&mut matches, &ACCOUNT, text, ValueType::Account);
 
@@ -192,6 +225,60 @@ mod tests {
     fn money_matches_symbol_and_code() {
         assert!(matched("a deposit of $1,200.50 today", ValueType::Money).contains(&"$1,200.50"));
         assert!(matched("about 2000 USD owed", ValueType::Money).contains(&"2000 USD"));
+    }
+
+    #[test]
+    fn percent_matches_numeric() {
+        assert!(matched("a fee of 10% applies", ValueType::Percent).contains(&"10%"));
+        assert!(matched("up to 10.5 % annually", ValueType::Percent).contains(&"10.5 %"));
+    }
+
+    #[test]
+    fn percent_matches_spelled_out() {
+        assert!(
+            matched("overcharged by ten percent or more", ValueType::Percent)
+                .contains(&"ten percent")
+        );
+    }
+
+    #[test]
+    fn percent_matches_combined_word_and_parenthetical_as_one_span() {
+        // The whole "ten percent (10%)" is one span, not "ten percent" + "10%" separately.
+        assert_eq!(
+            matched(
+                "Tenant has been overcharged by ten percent (10%) or more",
+                ValueType::Percent
+            ),
+            vec!["ten percent (10%)"]
+        );
+    }
+
+    #[test]
+    fn longer_number_word_wins_over_prefix() {
+        // "nineteen" must not be split into "nine".
+        assert_eq!(
+            matched("a nineteen percent share", ValueType::Percent),
+            vec!["nineteen percent"]
+        );
+    }
+
+    #[test]
+    fn money_matches_spelled_out_amount() {
+        assert!(
+            matched("pay two thousand dollars now", ValueType::Money)
+                .contains(&"two thousand dollars")
+        );
+        assert!(
+            matched("a deposit of five hundred pesos", ValueType::Money)
+                .contains(&"five hundred pesos")
+        );
+    }
+
+    #[test]
+    fn number_word_inside_an_ordinary_word_is_not_matched() {
+        // "Tenant" contains "ten" but is not followed by percent/currency.
+        assert!(matched("Tenant pays the rent", ValueType::Percent).is_empty());
+        assert!(matched("Tenant pays the rent", ValueType::Money).is_empty());
     }
 
     #[test]

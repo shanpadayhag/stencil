@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::censor::{CensorOptions, PartyList, censor};
+use crate::censor::{CensorOptions, IgnoreList, PartyList, censor};
 use crate::cli::DetectArgs;
 use crate::detect::detect;
 use crate::extract;
@@ -25,8 +25,8 @@ use crate::section::sections;
 
 /// Run the `detect` subcommand.
 pub fn run(args: DetectArgs) -> Result<()> {
-    if !args.censor && (args.parties.is_some() || args.guess_names) {
-        bail!("--parties and --guess-names require --censor");
+    if !args.censor && (args.parties.is_some() || args.guess_names || args.ignore.is_some()) {
+        bail!("--parties, --guess-names, and --ignore require --censor");
     }
 
     let extracted = extract::from_path(&args.input)?;
@@ -34,13 +34,18 @@ pub fn run(args: DetectArgs) -> Result<()> {
         Some(spec) => Some(PartyList::parse(spec)?),
         None => None,
     };
-    let (document, mapping) = maybe_censor(&extracted, &args, parties.as_ref());
+    let ignore = match &args.ignore {
+        Some(spec) => Some(IgnoreList::parse(spec)?),
+        None => None,
+    };
+    let (document, mapping) = maybe_censor(&extracted, &args, parties.as_ref(), ignore.as_ref());
 
     // Cross-paragraph artifacts are ALWAYS censored — heuristic names on, plus any party
     // list — so they are safe to share regardless of the main run's `--censor`.
     let review_options = CensorOptions {
         parties: parties.as_ref(),
         guess_names: true,
+        ignore: ignore.as_ref(),
     };
 
     let mut detection = detect(&document);
@@ -102,11 +107,12 @@ pub fn run(args: DetectArgs) -> Result<()> {
 }
 
 /// Apply censoring if requested, returning the (possibly rewritten) document and the
-/// mapping to persist. Party names are parsed by the caller and passed in.
+/// mapping to persist. Party and ignore lists are parsed by the caller and passed in.
 fn maybe_censor(
     document: &Document,
     args: &DetectArgs,
     parties: Option<&PartyList>,
+    ignore: Option<&IgnoreList>,
 ) -> (Document, Option<Mapping>) {
     if !args.censor {
         return (document.clone(), None);
@@ -114,6 +120,7 @@ fn maybe_censor(
     let options = CensorOptions {
         parties,
         guess_names: args.guess_names,
+        ignore,
     };
     let outcome = censor(document, &options);
     (outcome.document, Some(outcome.mapping))

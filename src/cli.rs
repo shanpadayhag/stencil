@@ -55,6 +55,10 @@ pub struct DetectArgs {
     #[arg(long)]
     pub guess_names: bool,
 
+    /// Phrases the name heuristic must never flag (defined terms): inline comma-separated, or `@file`.
+    #[arg(long)]
+    pub ignore: Option<String>,
+
     /// Mapping output, written only with `--censor` (default: `<input>.mapping.json`).
     #[arg(long)]
     pub map: Option<PathBuf>,

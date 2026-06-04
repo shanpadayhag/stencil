@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use crate::detect::paired_spans;
 use crate::model::{Block, Cell, Document, MAPPING_VERSION, Mapping, MappingEntry};
 
-pub use names::PartyList;
+pub use names::{IgnoreList, PartyList};
 
 /// The category of a censored value. Determines the placeholder prefix and the
 /// detector precedence used to resolve overlaps.
@@ -34,8 +34,12 @@ pub enum ValueType {
     Phone,
     /// A calendar date.
     Date,
-    /// A monetary amount.
+    /// A monetary amount (numeric like `$1,200` or spelled out like `two thousand
+    /// dollars`).
     Money,
+    /// A percentage (numeric like `10%` or spelled out like `ten percent`, including the
+    /// combined `ten percent (10%)` form).
+    Percent,
     /// An email address.
     Email,
 }
@@ -53,6 +57,7 @@ impl ValueType {
             ValueType::Phone => "PHONE",
             ValueType::Date => "DATE",
             ValueType::Money => "MONEY",
+            ValueType::Percent => "PERCENT",
             ValueType::Email => "EMAIL",
         }
     }
@@ -85,6 +90,8 @@ pub struct CensorOptions<'a> {
     pub parties: Option<&'a PartyList>,
     /// Whether to enable the opt-in capitalized-sequence name heuristic.
     pub guess_names: bool,
+    /// Phrases the heuristic must never treat as names (defined terms), if any.
+    pub ignore: Option<&'a IgnoreList>,
 }
 
 /// The result of censoring: the placeholder-bearing document plus the reversal mapping.
@@ -194,7 +201,7 @@ fn gather_candidates(text: &str, options: &CensorOptions<'_>) -> Vec<Candidate> 
         candidates.extend(list.find(text));
     }
     if options.guess_names {
-        candidates.extend(names::find_heuristic_names(text));
+        candidates.extend(names::find_heuristic_names(text, options.ignore));
     }
     candidates
 }
@@ -237,7 +244,7 @@ fn resolve_overlaps(mut candidates: Vec<Candidate>, reserved: &[(usize, usize)])
 fn precedence(candidate: &Candidate) -> u8 {
     match candidate.source {
         DetectSource::PartyList => 0,
-        DetectSource::Heuristic => 9,
+        DetectSource::Heuristic => 10,
         DetectSource::Pattern => match candidate.value_type {
             ValueType::Iban => 1,
             ValueType::Card => 2,
@@ -245,8 +252,9 @@ fn precedence(candidate: &Candidate) -> u8 {
             ValueType::Phone => 4,
             ValueType::Date => 5,
             ValueType::Money => 6,
-            ValueType::Email => 7,
-            ValueType::Person | ValueType::Org => 8,
+            ValueType::Percent => 7,
+            ValueType::Email => 8,
+            ValueType::Person | ValueType::Org => 9,
         },
     }
 }
@@ -384,6 +392,7 @@ mod tests {
         let options = CensorOptions {
             parties: Some(&list),
             guess_names: false,
+            ..Default::default()
         };
         let out = censor(&paragraph_doc("signed by Wonka Corporation"), &options);
         assert_eq!(out.mapping.entries.len(), 1);
@@ -404,6 +413,7 @@ mod tests {
             &CensorOptions {
                 parties: None,
                 guess_names: true,
+                ..Default::default()
             },
         );
         assert_eq!(on.mapping.entries.len(), 1);
@@ -421,6 +431,7 @@ mod tests {
             &CensorOptions {
                 parties: Some(&list),
                 guess_names: true,
+                ..Default::default()
             },
         );
         assert_eq!(out.mapping.entries.len(), 1);
@@ -435,6 +446,7 @@ mod tests {
             &CensorOptions {
                 parties: None,
                 guess_names: true,
+                ..Default::default()
             },
         );
         assert_eq!(censored_text(&out), "Signed by [Client Name] today");
@@ -449,6 +461,7 @@ mod tests {
             &CensorOptions {
                 parties: None,
                 guess_names: true,
+                ..Default::default()
             },
         );
         let text = censored_text(&out);
@@ -469,6 +482,32 @@ mod tests {
             &CensorOptions::default(),
         );
         assert!(censored_text(&out).contains("REDACTED_EMAIL_001"));
+    }
+
+    #[test]
+    fn combined_percent_is_censored_as_one_placeholder() {
+        let out = censor(
+            &paragraph_doc("overcharged by ten percent (10%) or more"),
+            &CensorOptions::default(),
+        );
+        assert_eq!(out.mapping.entries.len(), 1);
+        assert_eq!(out.mapping.entries[0].value_type, "PERCENT");
+        assert_eq!(out.mapping.entries[0].value, "ten percent (10%)");
+        assert_eq!(
+            censored_text(&out),
+            "overcharged by REDACTED_PERCENT_001 or more"
+        );
+    }
+
+    #[test]
+    fn spelled_out_amount_is_censored_as_money() {
+        let out = censor(
+            &paragraph_doc("pay two thousand dollars on signing"),
+            &CensorOptions::default(),
+        );
+        assert_eq!(out.mapping.entries.len(), 1);
+        assert_eq!(out.mapping.entries[0].value_type, "MONEY");
+        assert_eq!(out.mapping.entries[0].value, "two thousand dollars");
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! Each name's type (PERSON vs ORG) is decided by a simple rule: a name containing a
 //! known company suffix (Inc, LLC, Ltd, …) is an organization, otherwise a person.
 
+use std::collections::HashSet;
 use std::fs;
 use std::sync::LazyLock;
 
@@ -18,6 +19,180 @@ static HEURISTIC_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+\b")
         .expect("static HEURISTIC_NAME regex is valid")
 });
+
+/// Common Title-Case words from contract *defined terms* (e.g. "Annual Operating
+/// Expense Adjustment", "Base Rent", "Commencement Date"). A capitalized sequence
+/// containing any of these is a defined term, not a person, so the heuristic skips it.
+///
+/// Deliberately excludes words that double as real first names (April, May, Grace, …)
+/// so genuine names still flag.
+const NON_NAME_WORDS: &[&str] = &[
+    // recurrence / time
+    "annual",
+    "annually",
+    "monthly",
+    "quarterly",
+    "weekly",
+    "daily",
+    "yearly",
+    // accounting modifiers
+    "operating",
+    "expense",
+    "expenses",
+    "adjustment",
+    "base",
+    "rent",
+    "additional",
+    "gross",
+    "net",
+    "fixed",
+    "variable",
+    "total",
+    "minimum",
+    "maximum",
+    "average",
+    "estimated",
+    "actual",
+    "prorated",
+    "annualized",
+    // document structure
+    "agreement",
+    "lease",
+    "contract",
+    "section",
+    "article",
+    "clause",
+    "exhibit",
+    "schedule",
+    "appendix",
+    "addendum",
+    "amendment",
+    "rider",
+    "attachment",
+    // dates / terms
+    "date",
+    "term",
+    "period",
+    "commencement",
+    "termination",
+    "renewal",
+    "effective",
+    "expiration",
+    // generic parties / roles
+    "landlord",
+    "tenant",
+    "lessor",
+    "lessee",
+    "buyer",
+    "seller",
+    "purchaser",
+    "vendor",
+    "borrower",
+    "lender",
+    "guarantor",
+    "contractor",
+    "owner",
+    // property
+    "premises",
+    "property",
+    "building",
+    "unit",
+    "suite",
+    "floor",
+    "common",
+    "area",
+    "areas",
+    "improvements",
+    "land",
+    // money / finance
+    "payment",
+    "deposit",
+    "security",
+    "interest",
+    "rate",
+    "fee",
+    "fees",
+    "charge",
+    "charges",
+    "cost",
+    "costs",
+    "price",
+    "amount",
+    "balance",
+    "account",
+    "escrow",
+    "principal",
+    "installment",
+    "penalty",
+    "surcharge",
+    // legal concepts
+    "notice",
+    "default",
+    "breach",
+    "remedy",
+    "warranty",
+    "indemnity",
+    "liability",
+    "insurance",
+    "tax",
+    "taxes",
+    "services",
+    "service",
+    "maintenance",
+    "utilities",
+    "obligations",
+    "covenant",
+    "covenants",
+    "provisions",
+    "provision",
+];
+
+/// A user-supplied list of phrases the heuristic must never treat as names
+/// (`--ignore`). Phrases are compared case-insensitively with collapsed whitespace.
+#[derive(Debug, Default)]
+pub struct IgnoreList {
+    phrases: HashSet<String>,
+}
+
+impl IgnoreList {
+    /// Parse an `--ignore` specification: inline comma-separated, or `@path` to read
+    /// from a file (one per line and/or comma-separated).
+    ///
+    /// # Errors
+    /// Returns an error if a `@file` cannot be read.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let raw = if let Some(path) = spec.strip_prefix('@') {
+            fs::read_to_string(path)
+                .with_context(|| format!("failed to read ignore file `{path}`"))?
+        } else {
+            spec.to_string()
+        };
+        let phrases = raw
+            .split([',', '\n'])
+            .map(normalize_phrase)
+            .filter(|phrase| !phrase.is_empty())
+            .collect();
+        Ok(Self { phrases })
+    }
+
+    /// Whether the list is empty (no usable phrases were provided).
+    pub fn is_empty(&self) -> bool {
+        self.phrases.is_empty()
+    }
+
+    /// Whether `text` matches an ignored phrase.
+    fn contains(&self, text: &str) -> bool {
+        self.phrases.contains(&normalize_phrase(text))
+    }
+}
+
+/// Normalize a phrase for ignore-list comparison: lowercased, whitespace-collapsed.
+fn normalize_phrase(text: &str) -> String {
+    text.split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Tokens that mark a name as an organization rather than a person.
 const ORG_SUFFIXES: &[&str] = &[
@@ -105,16 +280,43 @@ impl PartyList {
 }
 
 /// Find capitalized-sequence name candidates (the opt-in, flagged heuristic).
-pub(crate) fn find_heuristic_names(text: &str) -> Vec<Candidate> {
+///
+/// Two suppressions keep contract *defined terms* from being mislabeled as people:
+/// the built-in [`NON_NAME_WORDS`] blocklist, and the user's `ignore` list. Names that
+/// look like organizations (a company suffix) are kept regardless of the blocklist.
+pub(crate) fn find_heuristic_names(text: &str, ignore: Option<&IgnoreList>) -> Vec<Candidate> {
     HEURISTIC_NAME
         .find_iter(text)
-        .map(|m| Candidate {
-            start: m.start(),
-            end: m.end(),
-            value_type: classify_name(m.as_str()),
-            source: DetectSource::Heuristic,
+        .filter_map(|m| {
+            let span = m.as_str();
+            if ignore.is_some_and(|list| list.contains(span)) {
+                return None;
+            }
+            let value_type = classify_name(span);
+            // A generic Title-Case defined term (no org suffix) is not a person.
+            if value_type == ValueType::Person && is_defined_term(span) {
+                return None;
+            }
+            Some(Candidate {
+                start: m.start(),
+                end: m.end(),
+                value_type,
+                source: DetectSource::Heuristic,
+            })
         })
         .collect()
+}
+
+/// Whether a capitalized phrase contains a [`NON_NAME_WORDS`] term, marking it a
+/// defined term rather than a person's name.
+fn is_defined_term(name: &str) -> bool {
+    name.split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+        .any(|word| {
+            NON_NAME_WORDS
+                .iter()
+                .any(|blocked| word.eq_ignore_ascii_case(blocked))
+        })
 }
 
 /// Classify a name as [`ValueType::Org`] if it contains a company suffix, else
@@ -183,7 +385,7 @@ mod tests {
     #[test]
     fn heuristic_finds_capitalized_sequences() {
         let text = "Signed by Jane Doe for Acme Corporation today";
-        let hits = find_heuristic_names(text);
+        let hits = find_heuristic_names(text, None);
         let spans: Vec<&str> = hits.iter().map(|c| &text[c.start..c.end]).collect();
 
         assert_eq!(spans, vec!["Jane Doe", "Acme Corporation"]);
@@ -193,6 +395,53 @@ mod tests {
     #[test]
     fn heuristic_ignores_single_capitalized_word() {
         // A lone capitalized word is not a name sequence.
-        assert!(find_heuristic_names("Payment due now.").is_empty());
+        assert!(find_heuristic_names("Payment due now.", None).is_empty());
+    }
+
+    #[test]
+    fn defined_term_is_not_flagged_as_a_person() {
+        let text = "The Annual Operating Expense Adjustment is due.";
+        assert!(find_heuristic_names(text, None).is_empty());
+    }
+
+    #[test]
+    fn defined_term_does_not_swallow_a_real_adjacent_name() {
+        // The blocklist suppresses the defined term but leaves a genuine name flagged.
+        let text = "Per the Base Rent schedule, Jane Doe signs.";
+        let spans: Vec<&str> = find_heuristic_names(text, None)
+            .iter()
+            .map(|c| &text[c.start..c.end])
+            .collect();
+        assert_eq!(spans, vec!["Jane Doe"]);
+    }
+
+    #[test]
+    fn org_with_blocklisted_word_is_still_kept() {
+        // "Operating" is blocklisted, but the company suffix makes this an org we keep.
+        let text = "signed for Global Operating Company";
+        let hits = find_heuristic_names(text, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].value_type, ValueType::Org);
+    }
+
+    #[test]
+    fn user_ignore_list_suppresses_named_phrases() {
+        let ignore = IgnoreList::parse("Project Phoenix, Blue Horizon").expect("parse");
+        // Without the list these capitalized sequences would flag as people.
+        assert!(find_heuristic_names("under Project Phoenix today", Some(&ignore)).is_empty());
+        assert!(find_heuristic_names("the Blue Horizon plan", Some(&ignore)).is_empty());
+        // Matching is case-insensitive and whitespace-insensitive.
+        assert!(find_heuristic_names("BLUE   HORIZON rollout", Some(&ignore)).is_empty());
+        // A name not on the list still flags.
+        assert_eq!(
+            find_heuristic_names("signed by Jane Doe", Some(&ignore)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn ignore_list_parses_inline_and_is_empty_when_blank() {
+        assert!(IgnoreList::parse("  ,  ").expect("parse").is_empty());
+        assert!(!IgnoreList::parse("Base Rent").expect("parse").is_empty());
     }
 }
