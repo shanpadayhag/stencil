@@ -52,10 +52,11 @@ fn docx_detect_pipeline_preserves_headings_and_tables() {
 
     // Heading preserved as a Markdown heading.
     assert!(markdown.contains("# Payment Terms"));
-    // Paragraph brackets detected and inventoried.
-    assert!(markdown.contains("| `[Amount]` | paired | confident |"));
-    assert!(markdown.contains("| `[days]` | paired | confident |"));
-    // Table rendered as a Markdown grid, and its bracket detected.
+    // Paragraph brackets detected; the inventory snippet is the whole paragraph.
+    assert!(
+        markdown.contains("| `The deposit is [Amount] due in [days] days.` | paired | confident |")
+    );
+    // Table rendered as a Markdown grid, and its bracket detected (snippet is the cell).
     assert!(markdown.contains("| Item | Value |"));
     assert!(markdown.contains("| Fee | [Fee] |"));
     assert!(markdown.contains("| `[Fee]` | paired | confident |"));

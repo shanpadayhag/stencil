@@ -33,18 +33,18 @@ stencil detect contract.txt
 
 ```sh
 stencil detect contract.docx --censor \
-    --parties "Acme Corporation, Jane Doe" \
-    --guess-names
+    --parties "Acme Corporation, Jane Doe"
 # → contract.stencil.md   (context shows REDACTED_* placeholders)
 # → contract.mapping.json (reversible mapping)
-# censorship summary printed to stderr
 ```
 
 - `--parties <list|@file>` — names to always censor (inline comma-separated, or `@path` to a file).
-- `--guess-names` — opt-in capitalized-sequence name heuristic. Noisy by design; every guess is
-  **flagged** in the summary for you to verify.
 - `--out <file>` / `--map <file>` — override the default output paths.
 - `--force` — overwrite existing output/mapping files.
+
+Structured values (emails, phone numbers, money, percentages, dates, IBANs, account and card
+numbers) are detected by pattern and censored automatically; `--parties` adds the names that only
+you know to redact.
 
 ### Restore real values
 
@@ -55,6 +55,11 @@ fill bracket variables, and never writes `.docx`):
 stencil restore contract.stencil.md --map contract.mapping.json
 # → contract.stencil.restored.md
 ```
+
+- `--only <tokens|@file>` — restore only specific placeholders (exact `REDACTED_*` tokens, inline
+  comma-separated or `@path`); every other placeholder is left in place. Default: restore all.
+- `-i` / `--interactive` — review each value one at a time and decide with a single keypress:
+  **[space]** skip (leave it redacted), **[enter]** restore, **[q]** quit & save. Needs a terminal.
 
 ## How it works
 

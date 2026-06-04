@@ -1,10 +1,14 @@
-//! Per-candidate review files for cross-paragraph bracket spans.
+//! Per-bracket snippet files.
 //!
-//! A cross-paragraph span (a `[` paired with a `]` in a later block) is genuinely
-//! ambiguous — it may be an intended multi-paragraph variable/condition, or two stray
-//! brackets that happened to pair. To let a human decide, each such span is written to
-//! its own small Markdown file, **always censored**, so it is safe to paste into Claude
-//! and to show colleagues before relying on it.
+//! Every detected bracket gets its own small Markdown file, **always censored**, so it
+//! is safe to paste into Claude or show colleagues. A bracket fully inside one block
+//! uses the whole block (e.g. the entire paragraph) as its snippet; a cross-paragraph
+//! span (a `[` paired with a `]` in a later block) uses the full `[`…`]` span and is
+//! additionally flagged as ambiguous (it may be an intended multi-paragraph
+//! variable/condition, or two stray brackets that happened to pair).
+//!
+//! Files are laid out under a `snippets/` directory: single-block snippets sit directly
+//! inside it, cross-paragraph spans in a `cross-paragraph/` subfolder.
 //!
 //! The detection core stays pure: this module only consumes a [`Detection`] and builds
 //! file contents in memory; the command layer does the actual writing.
@@ -27,12 +31,14 @@ pub struct ReviewFile {
     pub content: String,
 }
 
-/// Build one censored review file per cross-paragraph span in `detection`.
+/// Build one censored snippet file per distinct bracket snippet in `detection`.
 ///
-/// Each span's covering blocks are sliced from `document`, censored with `options` (so
-/// the output is always safe to share), rendered to Markdown, and assigned a path under
-/// `out_dir` named by a readable slug from the span's opening text. Returns an empty
-/// vector when there are no cross-paragraph spans.
+/// Each bracket's covering blocks are sliced from `document`, censored with `options`
+/// (so the output is always safe to share), rendered to Markdown, and assigned a path
+/// under `out_dir`: single-block snippets directly inside it, cross-paragraph spans in a
+/// `cross-paragraph/` subfolder. Brackets that cover the same block range (e.g. two
+/// brackets in one paragraph) share a single file. Returns an empty vector when there
+/// are no brackets.
 ///
 /// `document` should be the **uncensored** source: censoring is applied here exactly
 /// once, with `options`, regardless of how the main run was invoked.
@@ -52,9 +58,9 @@ pub struct ReviewFile {
 ///     ],
 /// };
 /// let detection = detect(&doc);
-/// let files = build_review_files(&doc, &detection, &CensorOptions::default(), Path::new("out"));
+/// let files = build_review_files(&doc, &detection, &CensorOptions::default(), Path::new("snippets"));
 /// assert_eq!(files.len(), 1);
-/// assert_eq!(files[0].path, PathBuf::from("out/if-the-buyer-defaults.md"));
+/// assert_eq!(files[0].path, PathBuf::from("snippets/cross-paragraph/if-the-buyer-defaults.md"));
 /// ```
 pub fn build_review_files(
     document: &Document,
@@ -63,12 +69,19 @@ pub fn build_review_files(
     out_dir: &Path,
 ) -> Vec<ReviewFile> {
     let mut files = Vec::new();
+    let mut seen_ranges: Vec<(usize, usize)> = Vec::new();
     let mut used_slugs: Vec<String> = Vec::new();
+    let mut used_cross_slugs: Vec<String> = Vec::new();
+    let cross_dir = out_dir.join("cross-paragraph");
 
     for hit in &detection.hits {
-        if hit.kind != BracketKind::PairedCrossParagraph {
+        let range = (hit.block, hit.end_block);
+        // One file per distinct block range — brackets sharing a paragraph share a file.
+        if seen_ranges.contains(&range) {
             continue;
         }
+        seen_ranges.push(range);
+
         // Whole covering blocks give the human full context; offsets within blocks do
         // not matter here, so block indices (stable across censoring) are all we need.
         let slice = Document {
@@ -76,26 +89,33 @@ pub fn build_review_files(
             blocks: document.blocks[hit.block..=hit.end_block].to_vec(),
         };
         let censored = censor(&slice, options).document;
-
         let opening = opening_text(&censored);
-        let slug = unique_slug(opening, &mut used_slugs);
+        let is_cross = hit.kind == BracketKind::PairedCrossParagraph;
+
+        let (dir, used) = if is_cross {
+            (cross_dir.as_path(), &mut used_cross_slugs)
+        } else {
+            (out_dir, &mut used_slugs)
+        };
+        let slug = unique_slug(opening, used);
         files.push(ReviewFile {
-            path: out_dir.join(format!("{slug}.md")),
-            content: render_review(&censored, hit.block, hit.end_block),
+            path: dir.join(format!("{slug}.md")),
+            content: render_review(&censored, hit.block, hit.end_block, is_cross),
         });
     }
 
     files
 }
 
-/// Replace each cross-paragraph hit's `span_text` with a **censored** preview, so the
-/// main inventory never displays a raw multi-paragraph span.
+/// Replace each cross-paragraph hit's `snippet` with a **censored** preview, so the main
+/// inventory never displays a raw multi-paragraph span.
 ///
 /// Censoring is done per-block before joining: censoring the joined string directly
 /// would not work, since its outer `[`\u{2026}`]` reserves the whole interior from
 /// redaction. `source` is the uncensored document; censoring runs with `options`, so the
 /// preview is safe regardless of the main run's `--censor` flag. Single-block hits are
-/// left untouched.
+/// left untouched — their snippet is the surrounding paragraph, already shown in the
+/// section context above the inventory.
 pub fn censor_cross_paragraph_previews(
     detection: &mut Detection,
     source: &Document,
@@ -110,7 +130,7 @@ pub fn censor_cross_paragraph_previews(
             blocks: source.blocks[hit.block..=hit.end_block].to_vec(),
         };
         let censored = censor(&slice, options).document;
-        hit.span_text = censored_span_preview(&censored);
+        hit.snippet = censored_span_preview(&censored);
     }
 }
 
@@ -138,38 +158,49 @@ fn censored_span_preview(censored: &Document) -> String {
     parts.join(" ")
 }
 
-/// The first paragraph's text starting just after its `[`, used to name the file. Falls
-/// back to the whole first paragraph (or `""`) when there is no bracket.
+/// The first block's text, used to name the file. `slugify` strips the leading `[` and
+/// other punctuation, so a cross-paragraph span beginning with `[` and a single-block
+/// paragraph both yield a readable slug. Falls back to `""` for an empty/table-only
+/// slice.
 fn opening_text(document: &Document) -> &str {
-    let first = document
+    document
         .blocks
         .iter()
         .find_map(|block| match block {
-            Block::Paragraph { text } => Some(text.as_str()),
-            _ => None,
+            Block::Heading { text, .. } | Block::Paragraph { text } => Some(text.as_str()),
+            Block::Table { .. } => None,
         })
-        .unwrap_or("");
-    match first.find('[') {
-        Some(index) => &first[index + '['.len_utf8()..],
-        None => first,
-    }
+        .unwrap_or("")
 }
 
-/// Render a censored span as a standalone review document.
-fn render_review(document: &Document, start_block: usize, end_block: usize) -> String {
+/// Render a censored snippet as a standalone Markdown document. Cross-paragraph spans
+/// (`is_cross`) get an extra ambiguity warning; single-block snippets get a plain header.
+fn render_review(
+    document: &Document,
+    start_block: usize,
+    end_block: usize,
+    is_cross: bool,
+) -> String {
     let mut out = String::new();
-    out.push_str(
-        "<!-- Generated by Stencil — censored cross-paragraph span for review. \
+    if is_cross {
+        out.push_str(
+            "<!-- Generated by Stencil — censored cross-paragraph span for review. \
 Safe to share; confirm whether this is an intended single variable before relying on it. -->\n",
-    );
-    out.push_str(&format!(
-        "# Cross-paragraph span — blocks {start_block}\u{2013}{end_block} (\u{26a0} review)\n\n"
-    ));
-    out.push_str(
-        "This bracketed span crosses paragraph boundaries, so Stencil flagged it for \
+        );
+        out.push_str(&format!(
+            "# Cross-paragraph span — blocks {start_block}\u{2013}{end_block} (\u{26a0} review)\n\n"
+        ));
+        out.push_str(
+            "This bracketed span crosses paragraph boundaries, so Stencil flagged it for \
 review. Confirm whether the `[`\u{2026}`]` is one intended variable/condition, or a \
 stray bracket.\n\n---\n\n",
-    );
+        );
+    } else {
+        out.push_str(
+            "<!-- Generated by Stencil — censored snippet for review. Safe to share. -->\n",
+        );
+        out.push_str(&format!("# Snippet — block {start_block}\n\n---\n\n"));
+    }
     for block in &document.blocks {
         match block {
             Block::Paragraph { text } => {
@@ -274,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_one_censored_file_per_cross_paragraph_span() {
+    fn cross_paragraph_file_lands_in_subfolder_and_is_censored() {
         let document = doc(vec![
             para("[Pay billing@acme.example by"),
             para("the end of the month]"),
@@ -284,13 +315,13 @@ mod tests {
             &document,
             &detection,
             &CensorOptions::default(),
-            Path::new("out"),
+            Path::new("snippets"),
         );
 
         assert_eq!(files.len(), 1);
         assert_eq!(
             files[0].path,
-            PathBuf::from("out/pay-redacted-email-001-by.md")
+            PathBuf::from("snippets/cross-paragraph/pay-redacted-email-001-by.md")
         );
         // The real value is censored; the file is safe to share.
         assert!(files[0].content.contains("REDACTED_EMAIL_001"));
@@ -300,7 +331,43 @@ mod tests {
     }
 
     #[test]
-    fn previews_are_censored_per_block() {
+    fn single_block_bracket_gets_a_whole_paragraph_snippet_file() {
+        let document = doc(vec![para("Pay billing@acme.example for [Invoice] now.")]);
+        let detection = detect(&document);
+        let files = build_review_files(
+            &document,
+            &detection,
+            &CensorOptions::default(),
+            Path::new("snippets"),
+        );
+
+        // One single-block snippet, directly in the snippets dir (not the subfolder).
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].path,
+            PathBuf::from("snippets/pay-redacted-email-001-for-invoice-now.md")
+        );
+        // The whole paragraph is the snippet, censored and safe to share.
+        assert!(files[0].content.contains("REDACTED_EMAIL_001"));
+        assert!(!files[0].content.contains("billing@acme.example"));
+        assert!(files[0].content.contains("[Invoice]"));
+    }
+
+    #[test]
+    fn two_brackets_in_one_paragraph_share_one_file() {
+        let document = doc(vec![para("Pay [Amount] to [Buyer] today.")]);
+        let detection = detect(&document);
+        let files = build_review_files(
+            &document,
+            &detection,
+            &CensorOptions::default(),
+            Path::new("snippets"),
+        );
+        assert_eq!(files.len(), 1, "two brackets, same paragraph → one file");
+    }
+
+    #[test]
+    fn cross_paragraph_preview_snippet_is_censored() {
         let document = doc(vec![
             para("[Pay billing@acme.example by"),
             para("the end of the month]"),
@@ -313,22 +380,22 @@ mod tests {
             .iter()
             .find(|hit| hit.kind == BracketKind::PairedCrossParagraph)
             .expect("cross-paragraph hit");
-        assert!(hit.span_text.contains("REDACTED_EMAIL_001"));
-        assert!(!hit.span_text.contains("billing@acme.example"));
+        assert!(hit.snippet.contains("REDACTED_EMAIL_001"));
+        assert!(!hit.snippet.contains("billing@acme.example"));
         // Span runs from the `[` to the `]`.
-        assert!(hit.span_text.starts_with('['));
-        assert!(hit.span_text.ends_with(']'));
+        assert!(hit.snippet.starts_with('['));
+        assert!(hit.snippet.ends_with(']'));
     }
 
     #[test]
-    fn no_cross_paragraph_spans_yields_no_files() {
-        let document = doc(vec![para("Pay [Amount] now."), para("Thanks.")]);
+    fn no_brackets_yields_no_files() {
+        let document = doc(vec![para("Nothing to fill here."), para("Thanks.")]);
         let detection = detect(&document);
         let files = build_review_files(
             &document,
             &detection,
             &CensorOptions::default(),
-            Path::new("out"),
+            Path::new("snippets"),
         );
         assert!(files.is_empty());
     }

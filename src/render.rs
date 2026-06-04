@@ -11,9 +11,9 @@ use crate::detect::{BracketHit, Status};
 use crate::model::{Block, Cell};
 use crate::section::Section;
 
-/// Maximum display width (in characters) for a bracket in the inventory table; longer
-/// spans (e.g. block conditions) are truncated, since their full text is in the
-/// section context above.
+/// Maximum display width (in characters) for a snippet in the inventory table; longer
+/// snippets (whole paragraphs, block conditions) are truncated, since their full text is
+/// in the section context above.
 const BRACKET_DISPLAY_MAX: usize = 60;
 
 /// Render the detected sections of a document into a Markdown snippet file.
@@ -35,7 +35,8 @@ const BRACKET_DISPLAY_MAX: usize = 60;
 /// let detection = detect(&doc);
 /// let md = render(&doc.source, &sections(&doc, &detection));
 /// assert!(md.contains("## Payment"));
-/// assert!(md.contains("| `[Amount]` | paired | confident |"));
+/// // The inventory snippet is the whole paragraph the bracket sits in.
+/// assert!(md.contains("| `Pay [Amount].` | paired | confident |"));
 /// ```
 pub fn render(source: &Path, sections: &[Section<'_>]) -> String {
     let mut out = String::new();
@@ -131,7 +132,7 @@ fn render_table(out: &mut String, rows: &[Vec<Cell>]) {
 /// Render the "Variables in this section" inventory table.
 fn render_inventory(out: &mut String, hits: &[&BracketHit]) {
     out.push_str("**Variables in this section:**\n\n");
-    out.push_str("| Bracket | Kind | Status |\n");
+    out.push_str("| Snippet | Kind | Status |\n");
     out.push_str("|---------|------|--------|\n");
     for hit in hits {
         let status = match hit.status {
@@ -140,7 +141,7 @@ fn render_inventory(out: &mut String, hits: &[&BracketHit]) {
         };
         out.push_str(&format!(
             "| {} | {} | {} |\n",
-            format_bracket_cell(&hit.span_text),
+            format_bracket_cell(&hit.snippet),
             hit.kind.label(),
             status,
         ));
@@ -201,8 +202,13 @@ mod tests {
         assert!(md.contains("## Payment Terms"));
         assert!(md.contains("The deposit is [Amount] due in [days] days."));
         assert!(md.contains("**Variables in this section:**"));
-        assert!(md.contains("| `[Amount]` | paired | confident |"));
-        assert!(md.contains("| `[days]` | paired | confident |"));
+        // Both brackets share the paragraph, so both inventory rows show the whole
+        // paragraph as the snippet.
+        assert_eq!(
+            md.matches("| `The deposit is [Amount] due in [days] days.` | paired | confident |")
+                .count(),
+            2
+        );
     }
 
     #[test]

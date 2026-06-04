@@ -34,7 +34,7 @@ pub struct MappingEntry {
     pub value_type: String,
     /// The real value the placeholder stands for.
     pub value: String,
-    /// How the value was detected: `party-list`, `heuristic`, or `regex:<kind>`.
+    /// How the value was detected: `party-list` or `regex:<kind>`.
     pub method: String,
     /// How many times the value occurred in the document.
     pub occurrences: usize,

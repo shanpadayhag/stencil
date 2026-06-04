@@ -11,6 +11,7 @@
 //! - [`section`] — slice the document into heading-delimited sections
 //! - [`render`] — emit the per-section Markdown
 //! - [`review`] — write per-candidate censored files for cross-paragraph spans
+//! - [`learn`] — persist interactive-restore decisions so `--censor` improves over time
 //! - [`commands`] — orchestrate the above for each subcommand
 #![forbid(unsafe_code)]
 
@@ -19,6 +20,7 @@ pub mod cli;
 pub mod commands;
 pub mod detect;
 pub mod extract;
+pub mod learn;
 pub mod model;
 pub mod render;
 pub mod review;

@@ -1,7 +1,7 @@
 //! Censoring: replace sensitive values with `REDACTED_<TYPE>_<NNN>` placeholders.
 //!
 //! The pipeline gathers candidate spans from [`patterns`] (structured values) and
-//! [`names`] (party list + opt-in heuristic), resolves overlaps by a **fixed
+//! [`names`] (the party list), resolves overlaps by a **fixed
 //! precedence** with **longest-match-wins** so every character is replaced at most
 //! once, dedups by exact value (one value → one stable placeholder), and records a
 //! [`Mapping`] for `restore`.
@@ -14,15 +14,15 @@ use std::collections::HashMap;
 use crate::detect::paired_spans;
 use crate::model::{Block, Cell, Document, MAPPING_VERSION, Mapping, MappingEntry};
 
-pub use names::{IgnoreList, PartyList};
+pub use names::PartyList;
 
 /// The category of a censored value. Determines the placeholder prefix and the
 /// detector precedence used to resolve overlaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueType {
-    /// A person's name (party list or heuristic).
+    /// A person's name (from the party list).
     Person,
-    /// An organization's name (party list or heuristic).
+    /// An organization's name (from the party list).
     Org,
     /// An IBAN.
     Iban,
@@ -68,8 +68,6 @@ impl ValueType {
 pub(crate) enum DetectSource {
     /// Matched an explicit party-name list entry (authoritative).
     PartyList,
-    /// Matched the opt-in capitalized-sequence heuristic (flagged).
-    Heuristic,
     /// Matched a structured-value regex.
     Pattern,
 }
@@ -88,10 +86,9 @@ pub(crate) struct Candidate {
 pub struct CensorOptions<'a> {
     /// The party-name list to always censor, if any.
     pub parties: Option<&'a PartyList>,
-    /// Whether to enable the opt-in capitalized-sequence name heuristic.
-    pub guess_names: bool,
-    /// Phrases the heuristic must never treat as names (defined terms), if any.
-    pub ignore: Option<&'a IgnoreList>,
+    /// Values the user has learned are safe to leave in the clear (see [`crate::learn`]).
+    /// Any candidate whose exact text appears here is **not** censored.
+    pub allow: Option<&'a std::collections::BTreeSet<String>>,
 }
 
 /// The result of censoring: the placeholder-bearing document plus the reversal mapping.
@@ -200,8 +197,9 @@ fn gather_candidates(text: &str, options: &CensorOptions<'_>) -> Vec<Candidate> 
     if let Some(list) = options.parties {
         candidates.extend(list.find(text));
     }
-    if options.guess_names {
-        candidates.extend(names::find_heuristic_names(text, options.ignore));
+    // Drop anything the user has learned is safe to leave in the clear.
+    if let Some(allow) = options.allow {
+        candidates.retain(|candidate| !allow.contains(&text[candidate.start..candidate.end]));
     }
     candidates
 }
@@ -239,12 +237,11 @@ fn resolve_overlaps(mut candidates: Vec<Candidate>, reserved: &[(usize, usize)])
     claimed
 }
 
-/// Precedence rank (lower wins): party names, then the structured order from the
-/// design, then the flagged heuristic names last.
+/// Precedence rank (lower wins): party names first, then the structured order from the
+/// design.
 fn precedence(candidate: &Candidate) -> u8 {
     match candidate.source {
         DetectSource::PartyList => 0,
-        DetectSource::Heuristic => 10,
         DetectSource::Pattern => match candidate.value_type {
             ValueType::Iban => 1,
             ValueType::Card => 2,
@@ -303,7 +300,6 @@ impl Allocator {
 fn method_label(source: DetectSource, value_type: ValueType) -> String {
     match source {
         DetectSource::PartyList => "party-list".to_string(),
-        DetectSource::Heuristic => "heuristic".to_string(),
         DetectSource::Pattern => format!("regex:{}", value_type.label().to_ascii_lowercase()),
     }
 }
@@ -391,7 +387,6 @@ mod tests {
         let list = PartyList::parse("Wonka Corporation").expect("parse");
         let options = CensorOptions {
             parties: Some(&list),
-            guess_names: false,
             ..Default::default()
         };
         let out = censor(&paragraph_doc("signed by Wonka Corporation"), &options);
@@ -402,76 +397,65 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_only_runs_when_enabled_and_is_flagged() {
-        let text = "Signed by Jane Doe today";
-
-        let off = censor(&paragraph_doc(text), &CensorOptions::default());
-        assert!(off.mapping.entries.is_empty());
-
-        let on = censor(
-            &paragraph_doc(text),
-            &CensorOptions {
-                parties: None,
-                guess_names: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(on.mapping.entries.len(), 1);
-        assert_eq!(on.mapping.entries[0].method, "heuristic");
-        assert_eq!(on.mapping.entries[0].value, "Jane Doe");
-    }
-
-    #[test]
-    fn party_list_beats_overlapping_heuristic() {
-        // "Jane Doe" is both a party-list entry and a heuristic match; party-list wins,
-        // so the entry's method is authoritative, not heuristic.
-        let list = PartyList::parse("Jane Doe").expect("parse");
+    fn learned_allowed_value_is_not_censored() {
+        let allow: std::collections::BTreeSet<String> =
+            ["billing@acme.example".to_string()].into_iter().collect();
         let out = censor(
-            &paragraph_doc("Signed by Jane Doe"),
+            &paragraph_doc("Reach billing@acme.example or sales@acme.example."),
             &CensorOptions {
-                parties: Some(&list),
-                guess_names: true,
+                allow: Some(&allow),
                 ..Default::default()
             },
         );
+        let text = censored_text(&out);
+        // The learned-safe value stays in the clear; the other email is still censored.
+        assert!(text.contains("billing@acme.example"), "allowed value kept");
+        assert!(text.contains("REDACTED_EMAIL_001"), "other value censored");
         assert_eq!(out.mapping.entries.len(), 1);
-        assert_eq!(out.mapping.entries[0].method, "party-list");
     }
 
     #[test]
-    fn bracket_label_is_not_censored_even_with_guess_names() {
-        // "[Client Name]" is a variable label to send to Claude, not a value to redact.
+    fn party_name_off_the_list_is_left_alone() {
+        // Without the heuristic, a plain capitalized name is not a sensitive value.
         let out = censor(
-            &paragraph_doc("Signed by [Client Name] today"),
-            &CensorOptions {
-                parties: None,
-                guess_names: true,
-                ..Default::default()
-            },
+            &paragraph_doc("Signed by Jane Doe today"),
+            &CensorOptions::default(),
         );
-        assert_eq!(censored_text(&out), "Signed by [Client Name] today");
+        assert!(out.mapping.entries.is_empty());
+        assert_eq!(censored_text(&out), "Signed by Jane Doe today");
+    }
+
+    #[test]
+    fn bracket_interior_is_not_censored() {
+        // A bracket's interior is a variable label to send to Claude, never a value to
+        // redact — even when it contains something a pattern would otherwise match.
+        let out = censor(
+            &paragraph_doc("Email [billing@acme.example] today"),
+            &CensorOptions::default(),
+        );
+        assert_eq!(censored_text(&out), "Email [billing@acme.example] today");
         assert!(out.mapping.entries.is_empty());
     }
 
     #[test]
     fn value_outside_bracket_still_censored_while_label_preserved() {
-        // Same heuristic name appears both inside a bracket (keep) and outside (censor).
+        // A real value outside a bracket is censored; an identical-looking one inside a
+        // bracket label is preserved.
         let out = censor(
-            &paragraph_doc("Jane Doe signs as [Client Name]."),
-            &CensorOptions {
-                parties: None,
-                guess_names: true,
-                ..Default::default()
-            },
+            &paragraph_doc("Reach billing@acme.example or [billing@acme.example]."),
+            &CensorOptions::default(),
         );
         let text = censored_text(&out);
-        assert!(text.contains("[Client Name]"), "bracket label preserved");
         assert!(
-            text.starts_with("REDACTED_PERSON_001"),
-            "outside name censored"
+            text.contains("[billing@acme.example]"),
+            "bracket label preserved"
+        );
+        assert!(
+            text.starts_with("Reach REDACTED_EMAIL_001"),
+            "outside value censored"
         );
         assert_eq!(out.mapping.entries.len(), 1);
-        assert_eq!(out.mapping.entries[0].value, "Jane Doe");
+        assert_eq!(out.mapping.entries[0].value, "billing@acme.example");
     }
 
     #[test]

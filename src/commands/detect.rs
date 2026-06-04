@@ -5,19 +5,22 @@
 //! censoring runs first so the section context in the Markdown shows `REDACTED_*`
 //! placeholders rather than real values, and a `mapping.json` is written for `restore`.
 //!
-//! Any cross-paragraph bracket spans additionally get their own always-censored review
-//! file under a `cross-paragraph/` subfolder (see [`crate::review`]). On success the
-//! command prints a single confirmation line and nothing else.
+//! Every detected bracket additionally gets its own always-censored snippet file under a
+//! `snippets/` folder (cross-paragraph spans in a `cross-paragraph/` subfolder); see
+//! [`crate::review`]. On success the command prints a single confirmation line.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::censor::{CensorOptions, IgnoreList, PartyList, censor};
+use std::collections::BTreeSet;
+
+use crate::censor::{CensorOptions, PartyList, censor};
 use crate::cli::DetectArgs;
 use crate::detect::detect;
 use crate::extract;
+use crate::learn::{self, LearnedStore};
 use crate::model::{Document, Mapping};
 use crate::render::render;
 use crate::review::{self, ReviewFile};
@@ -25,8 +28,8 @@ use crate::section::sections;
 
 /// Run the `detect` subcommand.
 pub fn run(args: DetectArgs) -> Result<()> {
-    if !args.censor && (args.parties.is_some() || args.guess_names || args.ignore.is_some()) {
-        bail!("--parties, --guess-names, and --ignore require --censor");
+    if !args.censor && args.parties.is_some() {
+        bail!("--parties requires --censor");
     }
 
     let extracted = extract::from_path(&args.input)?;
@@ -34,18 +37,16 @@ pub fn run(args: DetectArgs) -> Result<()> {
         Some(spec) => Some(PartyList::parse(spec)?),
         None => None,
     };
-    let ignore = match &args.ignore {
-        Some(spec) => Some(IgnoreList::parse(spec)?),
-        None => None,
-    };
-    let (document, mapping) = maybe_censor(&extracted, &args, parties.as_ref(), ignore.as_ref());
+    // Values the user has previously marked safe (via interactive restore) are skipped by
+    // censoring. Best-effort: a missing/unreadable store just means nothing is allowed yet.
+    let allowed = load_allowed_values();
+    let (document, mapping) = maybe_censor(&extracted, &args, parties.as_ref(), &allowed);
 
-    // Cross-paragraph artifacts are ALWAYS censored — heuristic names on, plus any party
-    // list — so they are safe to share regardless of the main run's `--censor`.
+    // Cross-paragraph artifacts are ALWAYS censored — using any party list plus the
+    // regex patterns — so they are safe to share regardless of the main run's `--censor`.
     let review_options = CensorOptions {
         parties: parties.as_ref(),
-        guess_names: true,
-        ignore: ignore.as_ref(),
+        allow: Some(&allowed),
     };
 
     let mut detection = detect(&document);
@@ -83,7 +84,7 @@ pub fn run(args: DetectArgs) -> Result<()> {
     if let Some(mapping) = &mapping {
         write_mapping(&map_path, mapping)?;
     }
-    write_review_files(&review_dir, &review_files)?;
+    write_review_files(&review_files)?;
 
     let hit_sections = secs.iter().filter(|section| section.has_hits()).count();
     let mut summary = format!(
@@ -97,7 +98,7 @@ pub fn run(args: DetectArgs) -> Result<()> {
     }
     if !review_files.is_empty() {
         summary.push_str(&format!(
-            " [{} cross-paragraph review file(s) in {}]",
+            " [{} snippet file(s) in {}]",
             review_files.len(),
             review_dir.display()
         ));
@@ -107,42 +108,49 @@ pub fn run(args: DetectArgs) -> Result<()> {
 }
 
 /// Apply censoring if requested, returning the (possibly rewritten) document and the
-/// mapping to persist. Party and ignore lists are parsed by the caller and passed in.
+/// mapping to persist. The party list and learned allowlist are passed in by the caller.
 fn maybe_censor(
     document: &Document,
     args: &DetectArgs,
     parties: Option<&PartyList>,
-    ignore: Option<&IgnoreList>,
+    allowed: &BTreeSet<String>,
 ) -> (Document, Option<Mapping>) {
     if !args.censor {
         return (document.clone(), None);
     }
     let options = CensorOptions {
         parties,
-        guess_names: args.guess_names,
-        ignore,
+        allow: Some(allowed),
     };
     let outcome = censor(document, &options);
     (outcome.document, Some(outcome.mapping))
 }
 
-/// The directory for per-candidate review files: a `cross-paragraph/` subfolder beside
-/// the main output file.
+/// Load the per-user learned allowlist, or an empty set if it cannot be located/read.
+fn load_allowed_values() -> BTreeSet<String> {
+    learn::store_path()
+        .and_then(|path| LearnedStore::load(&path))
+        .map(|store| store.allowed_values())
+        .unwrap_or_default()
+}
+
+/// The directory for per-bracket snippet files: a `snippets/` folder beside the main
+/// output file (with a `cross-paragraph/` subfolder for ambiguous spans).
 fn review_dir(out_path: &Path) -> PathBuf {
     out_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
-        .join("cross-paragraph")
+        .join("snippets")
 }
 
-/// Create the review subfolder (when there is anything to write) and write each file.
-fn write_review_files(dir: &Path, files: &[ReviewFile]) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-    fs::create_dir_all(dir).with_context(|| format!("failed to create `{}`", dir.display()))?;
+/// Write each snippet file, creating its parent directory as needed.
+fn write_review_files(files: &[ReviewFile]) -> Result<()> {
     for file in files {
+        if let Some(parent) = file.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create `{}`", parent.display()))?;
+        }
         fs::write(&file.path, &file.content)
             .with_context(|| format!("failed to write `{}`", file.path.display()))?;
     }

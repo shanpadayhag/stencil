@@ -51,14 +51,6 @@ pub struct DetectArgs {
     #[arg(long)]
     pub parties: Option<String>,
 
-    /// Opt-in capitalized-sequence name heuristic (results flagged for review).
-    #[arg(long)]
-    pub guess_names: bool,
-
-    /// Phrases the name heuristic must never flag (defined terms): inline comma-separated, or `@file`.
-    #[arg(long)]
-    pub ignore: Option<String>,
-
     /// Mapping output, written only with `--censor` (default: `<input>.mapping.json`).
     #[arg(long)]
     pub map: Option<PathBuf>,
@@ -77,6 +69,15 @@ pub struct RestoreArgs {
     /// Mapping file produced by a prior `detect --censor` run.
     #[arg(long)]
     pub map: PathBuf,
+
+    /// Restore only these placeholders (exact `REDACTED_*` tokens): inline comma-separated,
+    /// or `@file`. Default: every placeholder in the mapping.
+    #[arg(long, conflicts_with = "interactive")]
+    pub only: Option<String>,
+
+    /// Review each value one at a time: [space] skip, [enter] restore, [q] quit & save.
+    #[arg(short, long)]
+    pub interactive: bool,
 
     /// Restored output (default: `<input>.restored.<ext>`).
     #[arg(long)]
@@ -108,7 +109,6 @@ mod tests {
             "--censor",
             "--parties",
             "Acme,Jane Doe",
-            "--guess-names",
             "--force",
         ])
         .expect("valid detect invocation should parse");
@@ -117,7 +117,6 @@ mod tests {
             Command::Detect(args) => {
                 assert_eq!(args.input, PathBuf::from("contract.txt"));
                 assert!(args.censor);
-                assert!(args.guess_names);
                 assert!(args.force);
                 assert_eq!(args.parties.as_deref(), Some("Acme,Jane Doe"));
                 assert!(args.out.is_none());

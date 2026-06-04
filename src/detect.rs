@@ -18,13 +18,6 @@ use crate::model::{Block, Document};
 /// condition). Tunable; advisory only — it never changes detection, just labelling.
 pub const LONG_BRACKET_THRESHOLD: usize = 120;
 
-/// Maximum number of blocks a single cross-paragraph span may cover (the opening
-/// block, the closing block, and any in between). A `[` only pairs with a `]` in a
-/// later block when the span stays within this many blocks; beyond it the brackets
-/// stay lone. Bounds the blast radius of a stray `[` — especially in heading-less
-/// `.txt`, where the heading-boundary stop does not apply.
-pub const MAX_CROSS_BLOCK_SPAN: usize = 5;
-
 /// What kind of bracket a [`BracketHit`] represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BracketKind {
@@ -84,6 +77,11 @@ pub struct BracketHit {
     /// a cross-paragraph pair this is the full span joined across blocks (paragraphs
     /// separated by a blank line).
     pub span_text: String,
+    /// The snippet of context that represents this bracket. For a bracket fully inside
+    /// one block it is the **whole block** (e.g. the entire paragraph); for a
+    /// cross-paragraph pair it is the full `[`…`]` span across blocks. Used for the
+    /// inventory display and the per-bracket snippet files.
+    pub snippet: String,
     /// Index of the block where the span starts (the `[`).
     pub block: usize,
     /// Byte offset of the span start within `block`'s text.
@@ -158,10 +156,10 @@ pub fn detect(document: &Document) -> Detection {
 /// cross-paragraph span.
 ///
 /// Lone brackets are matched greedily nearest-first, mirroring the single-block rule.
-/// A pair is only formed when every block in the inclusive range is a
-/// [`Block::Paragraph`] (the heading-boundary stop, which also excludes tables) and the
-/// span covers at most [`MAX_CROSS_BLOCK_SPAN`] blocks. Formed pairs are always flagged
-/// for review; brackets that cannot pair stay lone.
+/// Pairing is purely syntactic: the only requirement is that the `]` sits in a later
+/// block than the `[`. Headings, tables, and the number of blocks in between are not
+/// gates — whatever falls between is captured as-is. Formed pairs are always flagged for
+/// review; a `]` with no earlier unmatched `[` stays lone.
 fn pair_across_blocks(document: &Document, detection: &mut Detection) {
     // `detection.hits` is in document order (blocks ascending, sorted within a block),
     // so a single stack pass pairs each `]` with the nearest unmatched earlier `[`.
@@ -207,28 +205,24 @@ fn pair_across_blocks(document: &Document, detection: &mut Detection) {
     detection.hits = kept;
 }
 
-/// Build a cross-paragraph hit from a lone `[` and a lone `]`, or `None` if the pair is
-/// disallowed (closing bracket not in a later block, a non-paragraph block in the way,
-/// or the span exceeds [`MAX_CROSS_BLOCK_SPAN`] blocks).
+/// Build a cross-paragraph hit from a lone `[` and a lone `]`, or `None` if the closing
+/// bracket is not in a strictly later block (the only requirement).
 fn cross_block_span(
     document: &Document,
     open: &BracketHit,
     close: &BracketHit,
 ) -> Option<BracketHit> {
     let (start_block, end_block) = (open.block, close.end_block);
-    if end_block <= start_block || end_block - start_block + 1 > MAX_CROSS_BLOCK_SPAN {
-        return None;
-    }
-    let all_paragraphs = (start_block..=end_block)
-        .all(|index| matches!(document.blocks.get(index), Some(Block::Paragraph { .. })));
-    if !all_paragraphs {
+    if end_block <= start_block {
         return None;
     }
 
+    let span_text = join_blocks(document, start_block, open.start, end_block, close.end);
     Some(BracketHit {
         kind: BracketKind::PairedCrossParagraph,
         status: Status::Guessed,
-        span_text: join_blocks(document, start_block, open.start, end_block, close.end),
+        snippet: span_text.clone(),
+        span_text,
         block: start_block,
         start: open.start,
         end_block,
@@ -236,8 +230,10 @@ fn cross_block_span(
     })
 }
 
-/// Join a span's text across paragraph blocks: the opening block from `start`, whole
-/// middle blocks, and the closing block up to `end`, separated by blank lines.
+/// Join a span's text across blocks: the opening block from `start`, whole middle
+/// blocks, and the closing block up to `end`, separated by blank lines. Non-paragraph
+/// blocks (headings, tables) are rendered to a flat text so any block can fall inside a
+/// span.
 fn join_blocks(
     document: &Document,
     start_block: usize,
@@ -247,13 +243,13 @@ fn join_blocks(
 ) -> String {
     let mut out = String::new();
     for index in start_block..=end_block {
-        let text = paragraph_text(document, index);
+        let text = block_text(document, index);
         let slice = if index == start_block {
-            &text[start..]
+            slice_from(&text, start)
         } else if index == end_block {
-            &text[..end]
+            slice_to(&text, end)
         } else {
-            text
+            &text[..]
         };
         if index != start_block {
             out.push_str("\n\n");
@@ -263,11 +259,44 @@ fn join_blocks(
     out
 }
 
-/// The text of a paragraph block, or `""` if absent or not a paragraph.
-fn paragraph_text(document: &Document, index: usize) -> &str {
+/// The flat text of any block: heading/paragraph text directly, table cells joined
+/// (`" | "` within a row, newline between rows). `""` if the index is out of range.
+fn block_text(document: &Document, index: usize) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
     match document.blocks.get(index) {
-        Some(Block::Paragraph { text }) => text.as_str(),
-        _ => "",
+        Some(Block::Heading { text, .. } | Block::Paragraph { text }) => Cow::Borrowed(text),
+        Some(Block::Table { rows }) => Cow::Owned(
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        None => Cow::Borrowed(""),
+    }
+}
+
+/// Slice `text` from `start`, falling back to the whole string when `start` is not a
+/// valid char boundary (e.g. an offset into a table's joined text).
+fn slice_from(text: &str, start: usize) -> &str {
+    if start <= text.len() && text.is_char_boundary(start) {
+        &text[start..]
+    } else {
+        text
+    }
+}
+
+/// Slice `text` up to `end`, falling back to the whole string when `end` is not a valid
+/// char boundary.
+fn slice_to(text: &str, end: usize) -> &str {
+    if end <= text.len() && text.is_char_boundary(end) {
+        &text[..end]
+    } else {
+        text
     }
 }
 
@@ -284,7 +313,7 @@ pub(crate) fn paired_spans(text: &str) -> Vec<(usize, usize)> {
         .hits
         .iter()
         .filter(|hit| hit.kind.is_paired())
-        .map(|hit| (hit.start, hit.start + hit.span_text.len()))
+        .map(|hit| (hit.start, hit.end))
         .collect()
 }
 
@@ -346,7 +375,8 @@ fn scan_text(text: &str, block: usize, detection: &mut Detection) {
     detection.hits[first_hit..].sort_by_key(|hit| hit.start);
 }
 
-/// Build a paired hit, classifying long spans.
+/// Build a paired hit, classifying long spans. The snippet is the whole text field
+/// (e.g. the entire paragraph) the bracket sits in.
 fn paired_hit(text: &str, block: usize, start: usize, end: usize) -> BracketHit {
     let span = &text[start..end];
     let kind = if span.chars().count() > LONG_BRACKET_THRESHOLD {
@@ -358,6 +388,7 @@ fn paired_hit(text: &str, block: usize, start: usize, end: usize) -> BracketHit 
         kind,
         status: Status::Confident,
         span_text: span.to_string(),
+        snippet: text.to_string(),
         block,
         start,
         end_block: block,
@@ -365,12 +396,14 @@ fn paired_hit(text: &str, block: usize, start: usize, end: usize) -> BracketHit 
     }
 }
 
-/// Build a lone (guessed) hit from a span.
+/// Build a lone (guessed) hit from a span. The snippet is the whole text field the
+/// bracket sits in.
 fn lone_hit(kind: BracketKind, text: &str, block: usize, start: usize, end: usize) -> BracketHit {
     BracketHit {
         kind,
         status: Status::Guessed,
         span_text: text[start..end].to_string(),
+        snippet: text.to_string(),
         block,
         start,
         end_block: block,
@@ -416,6 +449,21 @@ mod tests {
         assert_eq!(hit.block, 0);
         assert_eq!(hit.start, 4);
         assert!(result.balance.is_balanced());
+    }
+
+    #[test]
+    fn single_paragraph_snippet_is_the_whole_paragraph() {
+        let result = detect(&doc(vec![para(
+            "Pay [Buyer Name] the deposit of [Amount].",
+        )]));
+        assert_eq!(result.hits.len(), 2);
+        // Every bracket inside one paragraph carries the whole paragraph as its snippet,
+        // while span_text stays the precise bracket token.
+        for hit in &result.hits {
+            assert_eq!(hit.snippet, "Pay [Buyer Name] the deposit of [Amount].");
+        }
+        assert_eq!(result.hits[0].span_text, "[Buyer Name]");
+        assert_eq!(result.hits[1].span_text, "[Amount]");
     }
 
     #[test]
@@ -550,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_paragraph_does_not_pair_across_a_heading() {
+    fn cross_paragraph_pairs_across_a_heading() {
         let result = detect(&doc(vec![
             para("clause opens [here"),
             Block::Heading {
@@ -559,51 +607,29 @@ mod tests {
             },
             para("and closes ] there"),
         ]));
-        // No pairing across the heading: both brackets stay lone guesses.
-        assert_eq!(result.hits.len(), 2);
-        assert!(result.hits.iter().all(|hit| hit.status == Status::Guessed));
-        assert!(
-            result
-                .hits
-                .iter()
-                .all(|hit| hit.kind != BracketKind::PairedCrossParagraph)
-        );
+        // Headings are no longer a boundary: the span pairs straight through.
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert_eq!(hit.kind, BracketKind::PairedCrossParagraph);
+        assert_eq!(hit.status, Status::Guessed);
+        assert_eq!(hit.end_block, 2);
+        // The intervening heading text is captured in the span.
+        assert!(hit.span_text.contains("New Section"));
     }
 
     #[test]
-    fn cross_paragraph_respects_block_span_cap() {
-        // Open in block 0, close in block 5 → span of 6 blocks > MAX_CROSS_BLOCK_SPAN.
+    fn cross_paragraph_pairs_across_many_blocks() {
+        // Six blocks from `[` to `]` — well beyond the old cap, which is gone.
         let mut blocks = vec![para("opens [here")];
         for _ in 0..4 {
             blocks.push(para("filler paragraph"));
         }
         blocks.push(para("closes ] here"));
-        assert_eq!(blocks.len(), MAX_CROSS_BLOCK_SPAN + 1);
-
-        let result = detect(&doc(blocks));
-        assert!(
-            result
-                .hits
-                .iter()
-                .all(|hit| hit.kind != BracketKind::PairedCrossParagraph),
-            "a span beyond the cap must not pair"
-        );
-    }
-
-    #[test]
-    fn cross_paragraph_pairs_at_the_span_cap() {
-        // Open in block 0, close in the last allowed block → exactly the cap, pairs.
-        let mut blocks = vec![para("opens [here")];
-        for _ in 0..(MAX_CROSS_BLOCK_SPAN - 2) {
-            blocks.push(para("filler paragraph"));
-        }
-        blocks.push(para("closes ] here"));
-        assert_eq!(blocks.len(), MAX_CROSS_BLOCK_SPAN);
 
         let result = detect(&doc(blocks));
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].kind, BracketKind::PairedCrossParagraph);
-        assert_eq!(result.hits[0].end_block, MAX_CROSS_BLOCK_SPAN - 1);
+        assert_eq!(result.hits[0].end_block, 5);
     }
 
     #[test]
@@ -615,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_paragraph_does_not_pair_across_a_table() {
+    fn cross_paragraph_pairs_across_a_table() {
         let result = detect(&doc(vec![
             para("opens [here"),
             Block::Table {
@@ -623,11 +649,10 @@ mod tests {
             },
             para("closes ] here"),
         ]));
-        assert!(
-            result
-                .hits
-                .iter()
-                .all(|hit| hit.kind != BracketKind::PairedCrossParagraph)
-        );
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert_eq!(hit.kind, BracketKind::PairedCrossParagraph);
+        // The intervening table's cell text is captured in the span.
+        assert!(hit.span_text.contains("a | b"));
     }
 }

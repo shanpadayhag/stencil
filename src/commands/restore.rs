@@ -4,13 +4,17 @@
 //! (typically the `.stencil.md`). It reverses censorship only; it does not fill
 //! bracketed variables. `.docx` is never written (it is read-only in Stencil).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
 use crate::cli::RestoreArgs;
-use crate::model::{MAPPING_VERSION, Mapping};
+use crate::learn::{self, DecisionRecord, LearnedStore};
+use crate::model::{MAPPING_VERSION, Mapping, MappingEntry};
+
+mod interactive;
 
 /// Run the `restore` subcommand.
 pub fn run(args: RestoreArgs) -> Result<()> {
@@ -18,7 +22,18 @@ pub fn run(args: RestoreArgs) -> Result<()> {
     let input = fs::read_to_string(&args.input)
         .with_context(|| format!("failed to read input `{}`", args.input.display()))?;
 
-    let (restored, replaced) = apply(&mapping, &input);
+    let selected: Vec<&MappingEntry> = if args.interactive {
+        let decisions = interactive::select(&mapping, &input)?;
+        learn_from_decisions(&decisions, &mapping.source, &input);
+        decisions
+            .iter()
+            .filter(|decision| decision.allow)
+            .map(|decision| decision.entry)
+            .collect()
+    } else {
+        select_entries(&mapping, args.only.as_deref())?
+    };
+    let (restored, replaced) = apply(&selected, &input);
 
     let out_path = args
         .out
@@ -33,6 +48,48 @@ pub fn run(args: RestoreArgs) -> Result<()> {
         out_path.display()
     );
     Ok(())
+}
+
+/// Persist the interactive-restore decisions: append each to the JSONL training log and
+/// fold it into the per-user learned store. Best-effort — a storage hiccup must never
+/// fail the restore the user just completed, so problems are reported, not propagated.
+fn learn_from_decisions(decisions: &[interactive::Decision<'_>], source: &str, input: &str) {
+    if decisions.is_empty() {
+        return;
+    }
+    let (Ok(store_path), Ok(log_path)) = (learn::store_path(), learn::log_path()) else {
+        eprintln!("note: could not locate the config dir; decisions were not learned");
+        return;
+    };
+
+    let mut store = LearnedStore::load(&store_path).unwrap_or_default();
+    for decision in decisions {
+        let entry = decision.entry;
+        let record = DecisionRecord {
+            timestamp: learn::now_epoch_secs(),
+            source: source.to_string(),
+            placeholder: entry.placeholder.clone(),
+            value_type: entry.value_type.clone(),
+            value: entry.value.clone(),
+            decision: if decision.allow { "allow" } else { "deny" }.to_string(),
+            context: learn::context_window(input, &entry.placeholder),
+        };
+        if let Err(err) = learn::append_decision(&log_path, &record) {
+            eprintln!("note: could not log a decision: {err}");
+        }
+        store.record(&entry.value, &entry.value_type, decision.allow);
+    }
+
+    match store.save(&store_path) {
+        Ok(()) => {
+            let safe = decisions.iter().filter(|decision| decision.allow).count();
+            println!(
+                "Learned {} decision(s) ({safe} marked safe); future --censor runs will use them.",
+                decisions.len()
+            );
+        }
+        Err(err) => eprintln!("note: could not save the learned store: {err}"),
+    }
 }
 
 /// Read, parse, and version-check a `mapping.json`.
@@ -51,15 +108,49 @@ fn load_mapping(path: &Path) -> Result<Mapping> {
     Ok(mapping)
 }
 
-/// Substitute every placeholder with its value, returning the result and the number of
-/// occurrences replaced.
+/// Select the mapping entries to restore: all of them, or only those whose placeholder
+/// is named in `only` (inline comma/newline-separated, or `@file`).
+///
+/// # Errors
+/// Returns an error if an `@file` selection cannot be read.
+fn select_entries<'a>(mapping: &'a Mapping, only: Option<&str>) -> Result<Vec<&'a MappingEntry>> {
+    let Some(spec) = only else {
+        return Ok(mapping.entries.iter().collect());
+    };
+    let wanted = parse_selection(spec)?;
+    Ok(mapping
+        .entries
+        .iter()
+        .filter(|entry| wanted.contains(&entry.placeholder))
+        .collect())
+}
+
+/// Parse an `--only` selection into a set of placeholder tokens: inline comma/newline
+/// separated, or `@path` to read from a file.
+fn parse_selection(spec: &str) -> Result<HashSet<String>> {
+    let raw = if let Some(path) = spec.strip_prefix('@') {
+        fs::read_to_string(path)
+            .with_context(|| format!("failed to read selection file `{path}`"))?
+    } else {
+        spec.to_string()
+    };
+    Ok(raw
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Substitute each selected placeholder with its value, returning the result and the
+/// number of occurrences replaced.
 ///
 /// Placeholders are unique `REDACTED_<TYPE>_<NNN>` tokens and none is a substring of
 /// another, so a simple per-entry global replace is unambiguous.
-fn apply(mapping: &Mapping, text: &str) -> (String, usize) {
+fn apply(entries: &[&MappingEntry], text: &str) -> (String, usize) {
     let mut result = text.to_string();
     let mut replaced = 0usize;
-    for entry in &mapping.entries {
+    for entry in entries {
         let count = result.matches(&entry.placeholder).count();
         if count > 0 {
             result = result.replace(&entry.placeholder, &entry.value);
@@ -107,10 +198,15 @@ mod tests {
         }
     }
 
+    /// All entries of a mapping as references — the default (no `--only`) selection.
+    fn all(map: &Mapping) -> Vec<&MappingEntry> {
+        map.entries.iter().collect()
+    }
+
     #[test]
     fn replaces_all_occurrences() {
         let map = mapping(vec![("REDACTED_PERSON_001", "Jane Doe")]);
-        let (out, n) = apply(&map, "REDACTED_PERSON_001 met REDACTED_PERSON_001.");
+        let (out, n) = apply(&all(&map), "REDACTED_PERSON_001 met REDACTED_PERSON_001.");
         assert_eq!(out, "Jane Doe met Jane Doe.");
         assert_eq!(n, 2);
     }
@@ -118,12 +214,37 @@ mod tests {
     #[test]
     fn leaves_unmapped_tokens_uncounted() {
         let map = mapping(vec![("REDACTED_PERSON_001", "Jane")]);
-        let (out, n) = apply(&map, "REDACTED_PERSON_001 and REDACTED_ORG_009");
+        let (out, n) = apply(&all(&map), "REDACTED_PERSON_001 and REDACTED_ORG_009");
         assert_eq!(n, 1, "only the mapped placeholder is replaced");
         assert!(
             out.contains("REDACTED_ORG_009"),
             "the unmapped token is left as-is"
         );
+    }
+
+    #[test]
+    fn only_restores_selected_placeholders() {
+        let map = mapping(vec![
+            ("REDACTED_PERSON_001", "Jane Doe"),
+            ("REDACTED_EMAIL_001", "jane@acme.example"),
+        ]);
+        let selected = select_entries(&map, Some("REDACTED_PERSON_001")).expect("select");
+        let (out, n) = apply(&selected, "REDACTED_PERSON_001 at REDACTED_EMAIL_001");
+        assert_eq!(n, 1, "only the selected placeholder is restored");
+        assert!(out.contains("Jane Doe"), "selected value restored");
+        assert!(
+            out.contains("REDACTED_EMAIL_001"),
+            "unselected placeholder is left untouched"
+        );
+    }
+
+    #[test]
+    fn no_only_selects_every_entry() {
+        let map = mapping(vec![
+            ("REDACTED_PERSON_001", "Jane"),
+            ("REDACTED_EMAIL_001", "jane@acme.example"),
+        ]);
+        assert_eq!(select_entries(&map, None).expect("select").len(), 2);
     }
 
     #[test]
@@ -155,7 +276,7 @@ mod tests {
         };
         assert!(censored_text.contains("REDACTED_"));
 
-        let (restored, _) = apply(&outcome.mapping, &censored_text);
+        let (restored, _) = apply(&all(&outcome.mapping), &censored_text);
         assert_eq!(restored, original);
         assert!(
             !restored.contains("REDACTED_"),
