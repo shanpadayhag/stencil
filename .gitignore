@@ -2,3 +2,6 @@
 
 # macOS
 .DS_Store
+
+# Local env — auto-loaded by Stencil; keep untracked (may point at a private data dir)
+.env

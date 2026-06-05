@@ -135,6 +135,57 @@ fn txt_censor_writes_mapping_and_placeholders() {
 }
 
 #[test]
+fn dotenv_file_sets_the_data_dir() {
+    let dir = work_dir("dotenv");
+    // A visible data folder, seeded with an allow-only learned value.
+    let data = dir.join("visible-data");
+    fs::create_dir_all(&data).expect("create data dir");
+    fs::write(
+        data.join("learned.json"),
+        r#"{"version":1,"entries":[{"value":"keep@me.example","type":"EMAIL","allow":2,"deny":0}]}"#,
+    )
+    .expect("seed learned store");
+
+    // The `.env` in the working directory points STENCIL_DATA_DIR at that folder.
+    fs::write(
+        dir.join(".env"),
+        format!("STENCIL_DATA_DIR={}\n", data.display()),
+    )
+    .expect("seed .env");
+
+    let input = dir.join("c.txt");
+    let out = dir.join("c.stencil.md");
+    fs::write(&input, "Contact keep@me.example for [X].").expect("seed input");
+
+    let output = Command::new(BIN)
+        .args([
+            "detect",
+            input.to_str().unwrap(),
+            "--censor",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .current_dir(&dir) // so dotenvy finds the `.env` here
+        .env_remove("STENCIL_DATA_DIR") // only the `.env` provides it
+        .env("XDG_CONFIG_HOME", dir.join("xdg")) // isolate the default fallback
+        .output()
+        .expect("run stencil");
+    assert!(output.status.success(), "detect should succeed");
+
+    // The learned store loaded from the `.env`-specified folder marks this value
+    // allow-only, so censoring skips it — proof the `.env` drove the data dir. Without it,
+    // the email would be redacted.
+    let md = fs::read_to_string(&out).expect("read md");
+    assert!(
+        md.contains("keep@me.example"),
+        "allow-listed value kept; the .env data dir was honored"
+    );
+    assert!(!md.contains("REDACTED_EMAIL"), "value must not be redacted");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn refuses_overwrite_without_force() {
     let dir = work_dir("overwrite");
     let input = dir.join("contract.txt");
