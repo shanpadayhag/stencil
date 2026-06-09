@@ -1,15 +1,15 @@
-//! Subcommand orchestration: each module wires the pipeline stages together for
-//! one CLI subcommand.
+//! Subcommand orchestration: each module wires the pipeline stages together for the CLI.
+//!
+//! `review` is the only command.
 
-pub mod detect;
-pub mod restore;
+pub mod review;
 
 use std::path::Path;
 
 use anyhow::{Result, bail};
 
-/// Error if `path` already exists and `force` was not given. Shared by the commands
-/// that write output files.
+/// Error if `path` already exists and `force` was not given. Shared by the stages that write
+/// output files so a run never silently clobbers a prior one.
 pub(crate) fn ensure_writable(path: &Path, force: bool) -> Result<()> {
     if path.exists() && !force {
         bail!(
@@ -31,10 +31,8 @@ mod tests {
         let path: PathBuf =
             std::env::temp_dir().join(format!("stencil_ew_{}.tmp", std::process::id()));
         fs::write(&path, "x").expect("seed");
-
         assert!(ensure_writable(&path, false).is_err());
         assert!(ensure_writable(&path, true).is_ok());
-
         let _ = fs::remove_file(&path);
     }
 

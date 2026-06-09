@@ -1,19 +1,19 @@
 //! Command-line argument definitions (clap).
 //!
-//! Kept declarative: each subcommand maps to an `Args` struct that the matching
-//! module in [`crate::commands`] consumes.
+//! Kept declarative: the single `review` subcommand maps to [`ReviewArgs`], which the
+//! [`crate::commands::review`] module consumes.
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Top-level Stencil command.
 #[derive(Debug, Parser)]
 #[command(
     name = "stencil",
     version,
-    about = "Detect bracketed template variables (and optionally censor sensitive values) into a Markdown file for Claude Code.",
-    long_about = "Stencil scans a contract template (.docx or .txt) for bracketed fill-in variables and writes a context-rich Markdown file for Claude Code to read. With --censor it first replaces sensitive values (names, money, dates, IDs, emails) with REDACTED_* placeholders and writes a reversible mapping.json.\n\nIMPORTANT: Stencil is a best-effort first-pass filter, NOT a guarantee of complete redaction. Always review the censored output and the censorship summary before pasting anything into Claude."
+    about = "Interactively review a contract template: censor sensitive values, study document styling, and write a Markdown file for Claude Code.",
+    long_about = "Stencil's `review` command walks a contract template (.docx or .txt) through an interactive pipeline:\n\n  1. censor  — over-detect sensitive values; confirm / reject / re-type each one\n  2. styling — walk every block and flag formatting that looks wrong\n  3. snippet — write the context-rich Markdown + per-bracket snippet files for Claude Code\n\nThe review stages need an interactive terminal (TTY). IMPORTANT: censoring is a best-effort first-pass filter, NOT a guarantee of complete redaction — always review the output before sharing."
 )]
 pub struct Cli {
     /// Which subcommand to run.
@@ -24,76 +24,75 @@ pub struct Cli {
 /// The available subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Detect bracketed template variables and write a Markdown snippet file.
-    Detect(DetectArgs),
-    /// Restore real values into a file containing `REDACTED_*` placeholders.
-    Restore(RestoreArgs),
+    /// Review a template: censor, study styling, and write the Markdown snippet file.
+    Review(ReviewArgs),
 }
 
-/// Arguments for `stencil detect`.
+/// One stage of the `review` pipeline. Stages always run in pipeline order
+/// (`censor` → `styling` → `snippet`); `--only`/`--skip` just choose which run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Stage {
+    /// Detect and interactively review sensitive values.
+    Censor,
+    /// Walk every block and review its styling.
+    Styling,
+    /// Write the Markdown inventory and per-bracket snippet files.
+    Snippet,
+}
+
+impl Stage {
+    /// Every stage, in pipeline order.
+    pub const ALL: [Stage; 3] = [Stage::Censor, Stage::Styling, Stage::Snippet];
+
+    /// The lowercase stage name as used on the command line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Stage::Censor => "censor",
+            Stage::Styling => "styling",
+            Stage::Snippet => "snippet",
+        }
+    }
+}
+
+/// Arguments for `stencil review`.
 #[derive(Debug, Args)]
 #[command(
     after_help = "Review note: censoring is best-effort and not a guarantee of complete redaction. Check the censorship summary (and any ⚠ GUESSED brackets) before sharing the output."
 )]
-pub struct DetectArgs {
-    /// Input template to scan (`.docx` or `.txt`).
+pub struct ReviewArgs {
+    /// Input template to review (`.docx` or `.txt`).
     pub input: PathBuf,
 
     /// Output Markdown file (default: `<input>.stencil.md`).
     #[arg(long)]
     pub out: Option<PathBuf>,
 
-    /// Censor sensitive values before emitting the Markdown.
-    #[arg(long)]
-    pub censor: bool,
-
     /// Party names to always censor: inline comma-separated, or `@file` to read from a file.
     #[arg(long)]
     pub parties: Option<String>,
 
-    /// Mapping output, written only with `--censor` (default: `<input>.mapping.json`).
-    #[arg(long)]
-    pub map: Option<PathBuf>,
+    /// Run only these stages (comma-separated or repeated). Mutually exclusive with `--skip`.
+    #[arg(long, value_enum, value_delimiter = ',', conflicts_with = "skip")]
+    pub only: Vec<Stage>,
 
-    /// Directory holding the learning artifacts (`learned.json` + `decisions.jsonl`).
-    /// Overrides `STENCIL_DATA_DIR`; default `$XDG_CONFIG_HOME/stencil` or `~/.config/stencil`.
-    #[arg(long)]
-    pub data_dir: Option<PathBuf>,
+    /// Skip these stages (comma-separated or repeated). Mutually exclusive with `--only`.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub skip: Vec<Stage>,
 
-    /// Overwrite existing output/mapping files instead of refusing.
-    #[arg(long)]
-    pub force: bool,
-}
-
-/// Arguments for `stencil restore`.
-#[derive(Debug, Args)]
-pub struct RestoreArgs {
-    /// Input file containing `REDACTED_*` placeholders (text or Markdown).
-    pub input: PathBuf,
-
-    /// Mapping file produced by a prior `detect --censor` run.
-    #[arg(long)]
-    pub map: PathBuf,
-
-    /// Restore only these placeholders (exact `REDACTED_*` tokens): inline comma-separated,
-    /// or `@file`. Default: every placeholder in the mapping.
-    #[arg(long, conflicts_with = "interactive")]
-    pub only: Option<String>,
-
-    /// Review each value one at a time: [space] skip, [enter] restore, [q] quit & save.
-    #[arg(short, long)]
-    pub interactive: bool,
-
-    /// Restored output (default: `<input>.restored.<ext>`).
-    #[arg(long)]
-    pub out: Option<PathBuf>,
-
-    /// Directory holding the learning artifacts (`learned.json` + `decisions.jsonl`).
-    /// Overrides `STENCIL_DATA_DIR`; default `$XDG_CONFIG_HOME/stencil` or `~/.config/stencil`.
+    /// Root directory for the learning stores (default: `$XDG_CONFIG_HOME/stencil` or
+    /// `~/.config/stencil`). Per-model subdirs `censor/` and `styling/` live under it.
     #[arg(long)]
     pub data_dir: Option<PathBuf>,
 
-    /// Overwrite an existing output file instead of refusing.
+    /// Override the censor store location (else `<data_dir>/censor/`; env `STENCIL_CENSOR_DIR`).
+    #[arg(long)]
+    pub censor_dir: Option<PathBuf>,
+
+    /// Override the styling store location (else `<data_dir>/styling/`; env `STENCIL_STYLING_DIR`).
+    #[arg(long)]
+    pub styling_dir: Option<PathBuf>,
+
+    /// Overwrite existing output/snippet files instead of refusing.
     #[arg(long)]
     pub force: bool,
 }
@@ -111,57 +110,51 @@ mod tests {
     }
 
     #[test]
-    fn parses_detect_with_flags() {
+    fn parses_review_with_flags() {
         let cli = Cli::try_parse_from([
             "stencil",
-            "detect",
-            "contract.txt",
-            "--censor",
+            "review",
+            "contract.docx",
             "--parties",
             "Acme,Jane Doe",
             "--force",
         ])
-        .expect("valid detect invocation should parse");
+        .expect("valid review invocation should parse");
 
-        match cli.command {
-            Command::Detect(args) => {
-                assert_eq!(args.input, PathBuf::from("contract.txt"));
-                assert!(args.censor);
-                assert!(args.force);
-                assert_eq!(args.parties.as_deref(), Some("Acme,Jane Doe"));
-                assert!(args.out.is_none());
-            }
-            Command::Restore(_) => panic!("expected the detect subcommand"),
-        }
+        let Command::Review(args) = cli.command;
+        assert_eq!(args.input, PathBuf::from("contract.docx"));
+        assert!(args.force);
+        assert_eq!(args.parties.as_deref(), Some("Acme,Jane Doe"));
+        assert!(args.out.is_none());
+        assert!(args.only.is_empty());
+        assert!(args.skip.is_empty());
     }
 
     #[test]
-    fn parses_restore_with_required_map() {
-        let cli = Cli::try_parse_from([
-            "stencil",
-            "restore",
-            "contract.stencil.md",
-            "--map",
-            "contract.mapping.json",
-        ])
-        .expect("valid restore invocation should parse");
-
-        match cli.command {
-            Command::Restore(args) => {
-                assert_eq!(args.input, PathBuf::from("contract.stencil.md"));
-                assert_eq!(args.map, PathBuf::from("contract.mapping.json"));
-            }
-            Command::Detect(_) => panic!("expected the restore subcommand"),
-        }
+    fn parses_only_as_comma_list() {
+        let cli = Cli::try_parse_from(["stencil", "review", "c.docx", "--only", "censor,snippet"])
+            .expect("comma-separated stages should parse");
+        let Command::Review(args) = cli.command;
+        assert_eq!(args.only, vec![Stage::Censor, Stage::Snippet]);
     }
 
     #[test]
-    fn restore_requires_map() {
-        // `--map` is mandatory for restore; omitting it must be a parse error.
-        let result = Cli::try_parse_from(["stencil", "restore", "contract.stencil.md"]);
-        assert!(
-            result.is_err(),
-            "restore without --map should fail to parse"
-        );
+    fn rejects_unknown_stage() {
+        let result = Cli::try_parse_from(["stencil", "review", "c.docx", "--skip", "bogus"]);
+        assert!(result.is_err(), "an unknown stage name must fail to parse");
+    }
+
+    #[test]
+    fn only_and_skip_are_mutually_exclusive() {
+        let result = Cli::try_parse_from([
+            "stencil", "review", "c.docx", "--only", "censor", "--skip", "snippet",
+        ]);
+        assert!(result.is_err(), "--only and --skip together must error");
+    }
+
+    #[test]
+    fn detect_and_restore_are_gone() {
+        assert!(Cli::try_parse_from(["stencil", "detect", "c.txt"]).is_err());
+        assert!(Cli::try_parse_from(["stencil", "restore", "c.md", "--map", "m.json"]).is_err());
     }
 }

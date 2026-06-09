@@ -1,15 +1,16 @@
 # Stencil
 
-A fully-local Rust CLI that turns a contract template into a Markdown file Claude Code can read.
+A fully-local Rust CLI that walks a contract template through an interactive **review** pass and
+writes a context-rich Markdown file Claude Code can read.
 
-Stencil scans a template (`.docx` or `.txt`) for **bracketed fill-in variables** (e.g. `[Buyer Name]`)
-and writes a context-rich Markdown file — one entry per section, each with a bracket inventory — for
-Claude Code to read. Optionally it first **censors** sensitive values (names, money, dates, IDs, emails)
-into `REDACTED_*` placeholders and writes a reversible `mapping.json`.
+Stencil takes a template (`.docx` or `.txt`) and runs three stages in order — **censor**,
+**styling**, **snippet** — to produce a censored, navigable `<stem>.stencil.md` plus per-bracket
+snippet files. Every decision you make also trains Stencil's local, deterministic memory so the
+next run needs less input.
 
 > ⚠️ **Review before pasting.** Stencil is a best-effort first-pass filter, **not a guarantee of
-> complete redaction**. Always review the censored output and the printed censorship summary (and any
-> ⚠ GUESSED brackets) before pasting anything into Claude.
+> complete redaction**. Always review the output (and any ⚠ GUESSED brackets) before pasting
+> anything into Claude.
 
 ## Install
 
@@ -22,63 +23,70 @@ cargo build --release
 
 ## Usage
 
-### Detect bracketed variables
+`review` is the only command. It is interactive — it reads single keypresses — so it must be run
+directly in a terminal (TTY).
 
 ```sh
-stencil detect contract.txt
-# → contract.stencil.md  (+ bracket-balance report on stderr)
-```
-
-### Detect + censor sensitive values
-
-```sh
-stencil detect contract.docx --censor \
-    --parties "Acme Corporation, Jane Doe"
+stencil review contract.docx --parties "Acme Corporation, Jane Doe"
 # → contract.stencil.md   (context shows REDACTED_* placeholders)
-# → contract.mapping.json (reversible mapping)
+# → snippets/             (one censored file per bracket span)
 ```
+
+### The three stages
+
+1. **censor** — over-detects sensitive values (names, money, percentages, dates, emails, phones,
+   IDs, …) and walks you through each one: **[c]** confirm · **[t]** re-type · **[x]** reject
+   (false positive) · **[b]** back · **[q]** quit & save. Only confirmed values are censored.
+2. **styling** *(`.docx` only)* — walks every block and shows its formatting against the
+   document's norms; you mark each **[space]** fine or **[w]** weird (with a category and an
+   optional note). Purely a labelling pass — it changes no output.
+3. **snippet** — writes the `.stencil.md` section inventory plus a censored snippet file per
+   bracket span, cross-linked for navigation.
+
+Run a subset with `--only` or `--skip` (mutually exclusive, comma-separated):
+
+```sh
+stencil review contract.docx --only censor        # just the censor pass
+stencil review contract.docx --skip styling       # censor + snippet
+```
+
+### Flags
 
 - `--parties <list|@file>` — names to always censor (inline comma-separated, or `@path` to a file).
-- `--out <file>` / `--map <file>` — override the default output paths.
-- `--force` — overwrite existing output/mapping files.
-
-Structured values (emails, phone numbers, money, percentages, dates, IBANs, account and card
-numbers) are detected by pattern and censored automatically; `--parties` adds the names that only
-you know to redact.
-
-### Restore real values
-
-`restore` reverses censorship on any text/Markdown file containing `REDACTED_*` tokens (it does **not**
-fill bracket variables, and never writes `.docx`):
-
-```sh
-stencil restore contract.stencil.md --map contract.mapping.json
-# → contract.stencil.restored.md
-```
-
-- `--only <tokens|@file>` — restore only specific placeholders (exact `REDACTED_*` tokens, inline
-  comma-separated or `@path`); every other placeholder is left in place. Default: restore all.
-- `-i` / `--interactive` — review each value one at a time and decide with a single keypress:
-  **[space]** skip (leave it redacted), **[enter]** restore, **[q]** quit & save. Needs a terminal.
+- `--only <stages>` / `--skip <stages>` — choose stages (`censor`, `styling`, `snippet`).
+- `--out <file>` — override the Markdown output path (default `<input>.stencil.md`).
+- `--force` — overwrite existing output/snippet files instead of refusing.
+- `--data-dir <dir>` — root for the learning stores (default `$XDG_CONFIG_HOME/stencil` or
+  `~/.config/stencil`); also settable via `STENCIL_DATA_DIR`. Per-model subdirs `censor/` and
+  `styling/` live under it.
+- `--censor-dir <dir>` / `--styling-dir <dir>` — override a single model's store location (env:
+  `STENCIL_CENSOR_DIR` / `STENCIL_STYLING_DIR`).
 
 ## How it works
 
 ```
-template.docx/.txt → extract → [--censor] → detect brackets → section → render → <stem>.stencil.md
-                                    │                                              (+ mapping.json)
-                                    └→ REDACTED_* placeholders + censorship summary
+template.docx/.txt → extract → censor (confirm/reject) → styling (fine/weird) → snippet
+                                   │              │                                  │
+                                   │              │                          <stem>.stencil.md
+                                   │              │                          + snippets/
+                              decisions.jsonl   styling.jsonl + profiles/
+                              + learned.json    (per-doc style sidecar)
 ```
 
 - **Input is read-only.** `.docx` is never written back.
-- **Detection is lenient.** Lone (unpaired) brackets are still detected, with a *guessed* span flagged
-  for review, and a `[`/`]` balance diagnostic is printed.
-- **Censoring is reversible** via `mapping.json` and dedups by exact value (one value → one placeholder).
+- **One-way pass.** v6 has no `restore` step and writes no `mapping.json`; the censored text shown
+  and stored never carries real values.
+- **Deterministic learning.** Your decisions feed a per-user store: a value you reject becomes an
+  auto-skip on later runs; a value seen both ways stays censored. The append-only `decisions.jsonl`
+  and `styling.jsonl` logs are the labelled training sets for future models — no ML runs yet.
+- **Detection is lenient.** Lone (unpaired) brackets are still detected and flagged *guessed* for
+  review, with a `[`/`]` balance diagnostic.
 
 ## Scope
 
-Stencil detects variables and censors values. It does **not** name variables, write the questions to
-ask, choose input placeholders, classify block conditions, or fill the document — those are Claude's
-job, downstream.
+Stencil detects variables and censors values. It does **not** name variables, write the questions
+to ask, choose input placeholders, classify block conditions, or fill the document — those are
+Claude's job, downstream.
 
 ## License
 
