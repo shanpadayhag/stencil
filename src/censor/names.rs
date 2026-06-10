@@ -12,11 +12,23 @@ use regex::Regex;
 
 use super::{Candidate, DetectSource, ValueType};
 
-/// Matches a sequence of capitalized words (`Jane`, `Jane Doe`, `Acme Holdings`). Requires
-/// each word to be an uppercase letter followed by ≥1 lowercase letter, so all-caps acronyms
-/// (`NASA`), single letters, and codes (`GB82WEST…`) are not mistaken for names.
-static NAME_SEQUENCE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[A-Z][a-z]+(?:[ \t]+[A-Z][a-z]+)*").expect("valid name regex"));
+/// Matches a sequence of capitalized words (`Jane`, `Jane Doe`, `Acme Holdings`, the accented
+/// `Hélène Côté`, the hyphenated `Jean-Pierre`). Requires each word to be a Unicode uppercase
+/// letter followed by ≥1 lowercase letter, so all-caps acronyms (`NASA`), single letters, and
+/// codes (`GB82WEST…`) are not mistaken for names. Unicode classes (`\p{Lu}`/`\p{Ll}`) cover the
+/// accented letters of French names.
+static NAME_SEQUENCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\p{Lu}\p{Ll}+(?:[ \t\-]+\p{Lu}\p{Ll}+)*").expect("valid name regex")
+});
+
+/// French/English honorifics that prefix a person's name (`M. Dupont`, `Mme Lévesque`,
+/// `Me Tremblay`, `Dr. Smith`). Captured *with* the following capitalized name as one PERSON span.
+static HONORIFIC_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:MM?\.|Mme\.?|Mlle\.?|Me\.?|Dr\.?|Mr\.?|Mrs\.?|Ms\.?)[ \t]+\p{Lu}\p{Ll}+(?:[ \t\-]+\p{Lu}\p{Ll}+)*",
+    )
+    .expect("valid honorific regex")
+});
 
 /// Common function words and contract sentence-starters. A *single* capitalized word that is
 /// one of these is skipped (it is almost always capitalized by position, not a proper noun);
@@ -30,20 +42,37 @@ const STOPWORDS: &[&str] = &[
 
 /// One capitalized word within a matched sequence, used to trim stopword edges.
 static NAME_WORD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[A-Z][a-z]+").expect("valid word regex"));
+    LazyLock::new(|| Regex::new(r"\p{Lu}\p{Ll}+").expect("valid word regex"));
 
 /// Recall-first proper-noun guess: every capitalized word sequence is a candidate `ENTITY`
 /// (subtype unknown — the reviewer confirms or re-types it). Leading/trailing lone stopwords are
 /// trimmed (so "The Buyer" / "Pay Acme" become "Buyer" / "Acme"), and an all-stopword sequence is
 /// dropped. Over-detection is intentional; rejected guesses become negative training data.
 pub(crate) fn guess_entities(text: &str) -> Vec<Candidate> {
-    NAME_SEQUENCE
+    let mut candidates: Vec<Candidate> = NAME_SEQUENCE
         .find_iter(text)
         .filter_map(|m| trim_stopwords(m.as_str(), m.start()))
         .map(|(start, end)| Candidate {
             start,
             end,
             value_type: ValueType::Entity,
+            source: DetectSource::Heuristic,
+        })
+        .collect();
+    candidates.extend(honorific_names(text));
+    candidates
+}
+
+/// Honorific-prefixed names (`M. Dupont`, `Mme Lévesque`) as PERSON guesses — the title removes
+/// the subtype uncertainty that makes a bare capitalized word a neutral `ENTITY`. The longer
+/// honorific span wins over the inner bare-name guess during overlap resolution.
+fn honorific_names(text: &str) -> Vec<Candidate> {
+    HONORIFIC_NAME
+        .find_iter(text)
+        .map(|m| Candidate {
+            start: m.start(),
+            end: m.end(),
+            value_type: ValueType::Person,
             source: DetectSource::Heuristic,
         })
         .collect()
@@ -251,5 +280,28 @@ mod tests {
         // All-caps and alphanumeric codes are not name-like, so they are never flagged here.
         assert!(guessed("NASA and IBM signed").is_empty());
         assert!(guessed("ref GB82WEST12345698765432").is_empty());
+    }
+
+    #[test]
+    fn accented_french_names_are_guessed() {
+        let hits = guessed("Le contrat engage Hélène Côté et François Tremblay");
+        assert!(hits.contains(&"Hélène Côté"), "got {hits:?}");
+        assert!(hits.contains(&"François Tremblay"), "got {hits:?}");
+    }
+
+    #[test]
+    fn hyphenated_names_are_one_span() {
+        assert!(guessed("signé par Jean-Pierre Dubois").contains(&"Jean-Pierre Dubois"));
+    }
+
+    #[test]
+    fn honorific_prefixed_names_are_person_candidates() {
+        let text = "approuvé par M. Dupont aujourd'hui";
+        let persons: Vec<&str> = guess_entities(text)
+            .iter()
+            .filter(|candidate| candidate.value_type == ValueType::Person)
+            .map(|candidate| &text[candidate.start..candidate.end])
+            .collect();
+        assert_eq!(persons, vec!["M. Dupont"]);
     }
 }

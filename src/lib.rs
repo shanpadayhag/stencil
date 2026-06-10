@@ -20,9 +20,12 @@ pub mod censor;
 pub mod cli;
 pub mod commands;
 pub mod detect;
+pub mod doc_id;
 pub mod extract;
+pub mod lang;
 pub mod learn;
 pub mod model;
+pub mod pages;
 pub mod render;
 pub mod review;
 pub mod section;
@@ -47,5 +50,6 @@ use crate::cli::{Cli, Command};
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Review(args) => commands::review::run(args),
+        Command::Style(args) => commands::style::run(args),
     }
 }

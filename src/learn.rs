@@ -30,11 +30,13 @@ const STORE_VERSION: u32 = 1;
 
 /// Schema version stamped on each `decisions.jsonl` record. v6 bumped it to 3: the record is
 /// now keyed on the reviewed value with `method`/`detected_type`/`verdict`/`final_type` (the
-/// multi-class label), replacing the schema-2 `placeholder`/`type`/`decision` fields.
-const DECISION_SCHEMA: u32 = 3;
+/// multi-class label), replacing the schema-2 `placeholder`/`type`/`decision` fields. Schema 4
+/// (v7) adds `doc_id`, per-occurrence `block_kinds`/`heading_level`/`langs`, the decision scope,
+/// and edit provenance; schema-2/3 lines still deserialize via `#[serde(default)]`.
+const DECISION_SCHEMA: u32 = 4;
 
-/// Schema version stamped on each `styling.jsonl` record.
-const STYLING_SCHEMA: u32 = 1;
+/// Schema version stamped on each `styling.jsonl` record. Schema 2 (v7) adds `doc_id` + `lang`.
+const STYLING_SCHEMA: u32 = 2;
 
 /// Max chars kept on each side of the placeholder when growing the sentence window — a
 /// safety net so a terminator-less run can't capture an unbounded span.
@@ -240,7 +242,7 @@ impl LearnedStore {
 /// kept: `shown_context` (exactly what the reviewer saw — label provenance) and `block_context`
 /// (the richer paragraph). The log is append-only and never re-enriched. New fields carry
 /// `#[serde(default)]` so older schema-2 lines still deserialize.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DecisionRecord {
     /// Record schema version (see [`decision_schema`]).
     pub schema: u32,
@@ -269,6 +271,31 @@ pub struct DecisionRecord {
     /// How many times the value occurred in the document.
     #[serde(default)]
     pub occurrences: u32,
+    /// Content-derived document id — the stable grouping key (schema 4; see [`crate::doc_id`]).
+    #[serde(default)]
+    pub doc_id: String,
+    /// The decision's scope: `group` (a whole value-group) or `occurrence` (one split occurrence).
+    #[serde(default)]
+    pub scope: String,
+    /// The structural block kind(s) the value sits in: one for an occurrence, the distinct set for
+    /// a group (schema 4).
+    #[serde(default)]
+    pub block_kinds: Vec<String>,
+    /// Heading level for a heading occurrence; `None` for a group or a non-heading (schema 4).
+    #[serde(default)]
+    pub heading_level: Option<u8>,
+    /// The block language(s): one for an occurrence, the distinct set for a group (schema 4).
+    #[serde(default)]
+    pub langs: Vec<String>,
+    /// The reviewer adjusted the censored span's boundaries (schema 4).
+    #[serde(default)]
+    pub span_edited: bool,
+    /// The reviewer corrected the recorded context window (schema 4).
+    #[serde(default)]
+    pub context_edited: bool,
+    /// The reviewer added this value; the detector did not flag it (schema 4).
+    #[serde(default)]
+    pub user_added: bool,
 }
 
 /// The current decision-record schema version stamped on freshly written rows.
@@ -351,12 +378,21 @@ pub struct NeighborContext {
 /// `text` stored is censored (styling judgment needs no real values). Populated by the styling
 /// extraction/profile/review stages (T28–T30); defined here so the schema and its paths live
 /// alongside the censor record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct StylingRecord {
     /// Record schema version (see [`styling_schema`]).
     pub schema: u32,
-    /// The source document.
+    /// The source document filename.
     pub source: String,
+    /// Content-derived document id — the stable grouping key (schema 2; see [`crate::doc_id`]).
+    #[serde(default)]
+    pub doc_id: String,
+    /// The block's detected language code (schema 2).
+    #[serde(default)]
+    pub lang: String,
+    /// Language-detection confidence in 0..=1 (schema 2).
+    #[serde(default)]
+    pub lang_confidence: f32,
     /// Position of the block in document order.
     pub block_index: usize,
     /// `paragraph` | `heading` | `list_item` | `table_cell`.
@@ -639,11 +675,12 @@ mod tests {
     }
 
     #[test]
-    fn decision_record_round_trips_with_schema_3_fields() {
+    fn decision_record_round_trips_with_schema_4_fields() {
         let record = DecisionRecord {
             schema: decision_schema(),
             timestamp: 1,
             source: "c.txt".into(),
+            doc_id: "deadbeefcafe0001".into(),
             value: "Jane Doe".into(),
             method: "heuristic".into(),
             detected_type: "ENTITY".into(),
@@ -652,11 +689,19 @@ mod tests {
             shown_context: "pay REDACTED_ENTITY_001 today".into(),
             block_context: "The buyer pay REDACTED_ENTITY_001 today within 30 days".into(),
             occurrences: 2,
+            scope: "group".into(),
+            block_kinds: vec!["heading".into(), "paragraph".into()],
+            heading_level: None,
+            langs: vec!["en".into()],
+            span_edited: true,
+            ..Default::default()
         };
         let json = serde_json::to_string(&record).expect("serialize");
-        assert!(json.contains("\"schema\":3"));
-        assert!(json.contains("\"detected_type\":\"ENTITY\""));
-        assert!(json.contains("\"final_type\":\"PERSON\""));
+        assert!(json.contains("\"schema\":4"));
+        assert!(json.contains("\"doc_id\":\"deadbeefcafe0001\""));
+        assert!(json.contains("\"scope\":\"group\""));
+        assert!(json.contains("\"block_kinds\":[\"heading\",\"paragraph\"]"));
+        assert!(json.contains("\"langs\":[\"en\"]"));
         let back: DecisionRecord = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, record);
     }
@@ -665,21 +710,38 @@ mod tests {
     fn reject_record_serializes_null_final_type() {
         let record = DecisionRecord {
             schema: decision_schema(),
-            timestamp: 0,
             source: "c.txt".into(),
             value: "Reach".into(),
             method: "heuristic".into(),
             detected_type: "ENTITY".into(),
             verdict: "reject".into(),
             final_type: None,
-            shown_context: String::new(),
-            block_context: String::new(),
             occurrences: 1,
+            scope: "group".into(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&record).expect("serialize");
         assert!(json.contains("\"final_type\":null"));
         let back: DecisionRecord = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.final_type, None);
+    }
+
+    #[test]
+    fn occurrence_record_carries_single_kind_and_lang() {
+        // A split occurrence record: one kind, its heading level, one language, occurrences = 1.
+        let record = DecisionRecord {
+            schema: decision_schema(),
+            scope: "occurrence".into(),
+            block_kinds: vec!["heading".into()],
+            heading_level: Some(2),
+            langs: vec!["fr".into()],
+            occurrences: 1,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&record).expect("serialize");
+        assert!(json.contains("\"scope\":\"occurrence\""));
+        assert!(json.contains("\"heading_level\":2"));
+        assert!(json.contains("\"langs\":[\"fr\"]"));
     }
 
     #[test]
@@ -700,6 +762,9 @@ mod tests {
         let record = StylingRecord {
             schema: styling_schema(),
             source: "c.docx".into(),
+            doc_id: "deadbeefcafe0001".into(),
+            lang: "en".into(),
+            lang_confidence: 0.9,
             block_index: 12,
             block_kind: "list_item".into(),
             heading_level: None,
@@ -739,7 +804,9 @@ mod tests {
             note: Some("title as paragraph".into()),
         };
         let json = serde_json::to_string(&record).expect("serialize");
-        assert!(json.contains("\"schema\":1"));
+        assert!(json.contains("\"schema\":2"));
+        assert!(json.contains("\"doc_id\":\"deadbeefcafe0001\""));
+        assert!(json.contains("\"lang\":\"en\""));
         let back: StylingRecord = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, record);
     }

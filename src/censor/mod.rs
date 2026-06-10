@@ -22,6 +22,9 @@ use crate::model::{
 
 pub use names::PartyList;
 
+/// Identifies one text field of a document: the block index, and `(row, col)` for a table cell.
+type FieldKey = (usize, Option<(usize, usize)>);
+
 /// The category of a censored value. Determines the placeholder prefix and the
 /// detector precedence used to resolve overlaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,7 +392,7 @@ pub enum Verdict {
 }
 
 /// What a decision covers: a whole value-group, or a single occurrence carved out by a split.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DecisionScope {
     /// Every occurrence of the value, decided together (the default review).
     Group {
@@ -425,6 +428,12 @@ pub struct CensorDecision {
     pub shown_context: String,
     /// The paragraph window recorded for this decision.
     pub block_context: String,
+    /// The distinct block kind(s) the value sits in: one for an occurrence, the set for a group.
+    pub block_kinds: Vec<BlockKind>,
+    /// Heading level for a heading occurrence; `None` for a group or a non-heading.
+    pub heading_level: Option<u8>,
+    /// The distinct block language(s): one for an occurrence, the set for a group.
+    pub langs: Vec<String>,
     /// The reviewer adjusted the censored span's boundaries (the value was retargeted).
     pub span_edited: bool,
     /// The reviewer corrected the recorded context window.
@@ -434,8 +443,9 @@ pub struct CensorDecision {
 }
 
 impl CensorDecision {
-    /// A whole-group decision built from a reviewed item, using its first occurrence's context.
-    /// Edit/add flows tweak the result before recording it.
+    /// A whole-group decision built from a reviewed item, using its first occurrence's context and
+    /// the distinct kinds/languages across its occurrences. Edit/add flows tweak the result before
+    /// recording it.
     pub fn from_item(item: &ReviewItem, verdict: Verdict, reviewed: bool) -> Self {
         Self {
             value: item.value.clone(),
@@ -448,6 +458,9 @@ impl CensorDecision {
             },
             shown_context: item.first_shown_context().to_string(),
             block_context: item.first_block_context().to_string(),
+            block_kinds: item.block_kinds().into_iter().collect(),
+            heading_level: None,
+            langs: distinct_langs(&item.occurrences),
             span_edited: false,
             context_edited: false,
             user_added: false,
@@ -463,6 +476,13 @@ impl CensorDecision {
         occurrence: Occurrence,
         verdict: Verdict,
     ) -> Self {
+        let block_kinds = vec![occurrence.block_kind];
+        let heading_level = occurrence.heading_level;
+        let langs = if occurrence.lang.is_empty() {
+            Vec::new()
+        } else {
+            vec![occurrence.lang.clone()]
+        };
         Self {
             value: value.to_string(),
             detected_type,
@@ -472,6 +492,9 @@ impl CensorDecision {
             shown_context: occurrence.shown_context.clone(),
             block_context: occurrence.block_context.clone(),
             scope: DecisionScope::Occurrence(Box::new(occurrence)),
+            block_kinds,
+            heading_level,
+            langs,
             span_edited: false,
             context_edited: false,
             user_added: false,
@@ -492,6 +515,25 @@ impl CensorDecision {
     fn is_user_supplied(&self) -> bool {
         self.span_edited || self.user_added
     }
+
+    /// The wire label for this decision's scope.
+    fn scope_label(&self) -> &'static str {
+        match self.scope {
+            DecisionScope::Group { .. } => "group",
+            DecisionScope::Occurrence(_) => "occurrence",
+        }
+    }
+}
+
+/// The distinct, non-empty languages across `occurrences`, sorted for determinism.
+fn distinct_langs(occurrences: &[Occurrence]) -> Vec<String> {
+    occurrences
+        .iter()
+        .filter(|occurrence| !occurrence.lang.is_empty())
+        .map(|occurrence| occurrence.lang.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// A located text field of a document: one heading/paragraph, or one table cell, tagged with
@@ -563,6 +605,7 @@ pub fn plan_review(document: &Document, options: &CensorOptions<'_>) -> Vec<Revi
                 heading_level: field.heading_level,
                 shown_context: sentence_window_at(field.text, candidate.start, candidate.end),
                 block_context: block_window_at(field.text, candidate.start, candidate.end),
+                ..Default::default() // lang tagged in a later pass (see `tag_occurrence_languages`)
             };
             if let Some(item) = items.get_mut(&value) {
                 item.occurrences.push(occurrence);
@@ -584,6 +627,35 @@ pub fn plan_review(document: &Document, options: &CensorOptions<'_>) -> Vec<Revi
         .into_iter()
         .filter_map(|value| items.remove(&value))
         .collect()
+}
+
+/// Tag every occurrence with its block's detected language (a v7 training feature).
+///
+/// Detection is per text field with a document-dominant fallback for short blocks (see
+/// [`crate::lang`]); `override_lang` forces a code on every block. All occurrences in the same
+/// field share that field's language.
+pub fn tag_occurrence_languages(
+    document: &Document,
+    items: &mut [ReviewItem],
+    override_lang: Option<&str>,
+) {
+    let fields = document_fields(document);
+    let texts: Vec<&str> = fields.iter().map(|field| field.text).collect();
+    let tags = crate::lang::tag_texts(&texts, override_lang);
+    let by_field: HashMap<FieldKey, &crate::lang::BlockLang> = fields
+        .iter()
+        .zip(&tags)
+        .map(|(field, tag)| ((field.block_index, field.cell), tag))
+        .collect();
+    for occurrence in items
+        .iter_mut()
+        .flat_map(|item| item.occurrences.iter_mut())
+    {
+        if let Some(tag) = by_field.get(&(occurrence.block_index, occurrence.cell)) {
+            occurrence.lang = tag.lang.clone();
+            occurrence.lang_confidence = tag.confidence;
+        }
+    }
 }
 
 /// Build a [`ReviewItem`] for an exact `value` by locating every literal occurrence across the
@@ -613,6 +685,7 @@ pub(crate) fn locate_value(
                 heading_level: field.heading_level,
                 shown_context: sentence_window_at(field.text, start, end),
                 block_context: block_window_at(field.text, start, end),
+                ..Default::default()
             });
         }
     }
@@ -629,7 +702,7 @@ pub(crate) fn locate_value(
 
 /// Occurrence-scoped censor spans for one document, keyed by `(block_index, cell)` — the field a
 /// span lives in. Each entry is `(start, end, label)`.
-type OccurrenceSpans<'a> = HashMap<(usize, Option<(usize, usize)>), Vec<(usize, usize, &'a str)>>;
+type OccurrenceSpans<'a> = HashMap<FieldKey, Vec<(usize, usize, &'a str)>>;
 
 /// Apply the decisions: a copy of `document` with every **confirmed** value replaced by a
 /// `REDACTED_<FINAL_TYPE>_<NNN>` placeholder (deduped per value); rejected values are left as-is.
@@ -865,11 +938,13 @@ impl LabelAllocator {
     }
 }
 
-/// Build the decision-log records for the human-reviewed decisions (auto-defaulted items are
-/// skipped). Each [`CensorDecision`] is self-contained, so no parallel `items` slice is needed.
+/// Build the schema-4 decision-log records for the human-reviewed decisions (auto-defaulted items
+/// are skipped). Each [`CensorDecision`] is self-contained, so no parallel `items` slice is needed.
+/// `doc_id` is the content id keying every record from this document; `source` is the filename.
 pub fn decision_records(
     decisions: &[CensorDecision],
     source: &str,
+    doc_id: &str,
     timestamp: u64,
 ) -> Vec<DecisionRecord> {
     decisions
@@ -884,6 +959,7 @@ pub fn decision_records(
                 schema: decision_schema(),
                 timestamp,
                 source: source.to_string(),
+                doc_id: doc_id.to_string(),
                 value: decision.value.clone(),
                 method: decision.method.clone(),
                 detected_type: decision.detected_type.label().to_string(),
@@ -892,6 +968,17 @@ pub fn decision_records(
                 shown_context: decision.shown_context.clone(),
                 block_context: decision.block_context.clone(),
                 occurrences: decision.occurrences(),
+                scope: decision.scope_label().to_string(),
+                block_kinds: decision
+                    .block_kinds
+                    .iter()
+                    .map(|kind| kind.as_str().to_string())
+                    .collect(),
+                heading_level: decision.heading_level,
+                langs: decision.langs.clone(),
+                span_edited: decision.span_edited,
+                context_edited: decision.context_edited,
+                user_added: decision.user_added,
             }
         })
         .collect()
@@ -1204,6 +1291,7 @@ mod tests {
                 heading_level: None,
                 shown_context: format!("ctx {value}"),
                 block_context: format!("blk {value}"),
+                ..Default::default()
             }],
         }
     }
@@ -1398,6 +1486,7 @@ mod tests {
             heading_level: None,
             shown_context: "rate of 3% applies".into(),
             block_context: "the full clause".into(),
+            ..Default::default()
         };
         let decision = CensorDecision::from_occurrence(
             "3%",
@@ -1426,6 +1515,7 @@ mod tests {
             heading_level: None,
             shown_context: String::new(),
             block_context: String::new(),
+            ..Default::default()
         }
     }
 
@@ -1491,6 +1581,46 @@ mod tests {
     }
 
     #[test]
+    fn tag_occurrence_languages_tags_per_block_with_fallback_and_override() {
+        // A long English block sets the dominant; the short block falls back to it.
+        let doc = Document {
+            source: PathBuf::from("c.txt"),
+            blocks: vec![
+                Block::Paragraph {
+                    text: "This agreement is governed by the laws of New York and binding \
+                           arbitration applies; contact a@b.com for details."
+                        .into(),
+                },
+                Block::Paragraph {
+                    text: "See a@b.com.".into(),
+                },
+            ],
+        };
+
+        let mut items = plan_review(&doc, &CensorOptions::default());
+        tag_occurrence_languages(&doc, &mut items, None);
+        let email = items
+            .iter()
+            .find(|item| item.value == "a@b.com")
+            .expect("email detected in both blocks");
+        assert_eq!(email.occurrences.len(), 2);
+        assert!(
+            email.occurrences.iter().all(|occ| occ.lang == "en"),
+            "both blocks resolve to English (the short one via fallback)"
+        );
+
+        // Override forces every occurrence's language.
+        let mut forced = plan_review(&doc, &CensorOptions::default());
+        tag_occurrence_languages(&doc, &mut forced, Some("fr"));
+        assert!(
+            forced
+                .iter()
+                .flat_map(|item| &item.occurrences)
+                .all(|occ| occ.lang == "fr")
+        );
+    }
+
+    #[test]
     fn locate_value_finds_every_occurrence_or_none() {
         let doc = Document {
             source: PathBuf::from("c.docx"),
@@ -1517,7 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn decision_records_skip_unreviewed_and_map_schema_3_fields() {
+    fn decision_records_skip_unreviewed_and_map_schema_4_fields() {
         let decisions = vec![
             confirm_dec("a@b.com", ValueType::Email, "EMAIL"),
             reject_dec("Jane", ValueType::Entity),
@@ -1529,9 +1659,11 @@ mod tests {
                 false,
             ),
         ];
-        let records = decision_records(&decisions, "c.txt", 7);
+        let records = decision_records(&decisions, "c.txt", "doc0000000000abcd", 7);
         assert_eq!(records.len(), 2, "the unreviewed item is not logged");
         assert_eq!(records[0].schema, decision_schema());
+        assert_eq!(records[0].doc_id, "doc0000000000abcd");
+        assert_eq!(records[0].scope, "group");
         assert_eq!(records[0].verdict, "confirm");
         assert_eq!(records[0].final_type.as_deref(), Some("EMAIL"));
         assert_eq!(records[0].detected_type, "EMAIL");
@@ -1539,6 +1671,30 @@ mod tests {
         assert_eq!(records[1].verdict, "reject");
         assert_eq!(records[1].final_type, None, "reject has no final type");
         assert_eq!(records[1].detected_type, "ENTITY");
+    }
+
+    #[test]
+    fn occurrence_scoped_record_carries_kind_level_and_lang() {
+        // A split occurrence decision logs its single block kind, heading level, and language.
+        let mut occurrence = occ_at(None, 0, 2);
+        occurrence.block_kind = BlockKind::Heading;
+        occurrence.heading_level = Some(2);
+        occurrence.lang = "fr".into();
+        let decisions = vec![CensorDecision::from_occurrence(
+            "3%",
+            ValueType::Percent,
+            "regex:percent",
+            occurrence,
+            Verdict::Confirm {
+                final_type: "PERCENT".into(),
+            },
+        )];
+        let records = decision_records(&decisions, "c.txt", "docid", 1);
+        assert_eq!(records[0].scope, "occurrence");
+        assert_eq!(records[0].block_kinds, vec!["heading".to_string()]);
+        assert_eq!(records[0].heading_level, Some(2));
+        assert_eq!(records[0].langs, vec!["fr".to_string()]);
+        assert_eq!(records[0].occurrences, 1);
     }
 
     #[test]

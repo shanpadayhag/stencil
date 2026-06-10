@@ -576,6 +576,7 @@ mod tests {
                 heading_level: None,
                 shown_context: format!("ctx {value}"),
                 block_context: format!("blk {value}"),
+                ..Default::default()
             }],
         }
     }
@@ -626,6 +627,7 @@ mod tests {
                 heading_level: (i == 0).then_some(1),
                 shown_context: format!("ctx{i} {value}"),
                 block_context: format!("blk{i}"),
+                ..Default::default()
             })
             .collect();
         ReviewItem {

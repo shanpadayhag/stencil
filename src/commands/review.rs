@@ -4,8 +4,8 @@
 //! `--only`/`--skip`. The review stages read single keypresses, so the command requires an
 //! interactive terminal (TTY) and refuses to run without one.
 //!
-//! - **censor** (T26): detect candidates → interactive confirm/reject/re-type → apply only the
-//!   confirmed values → append schema-3 decisions and fold them into the learned store.
+//! - **censor** (T26): detect candidates → interactive confirm/reject/re-type/edit/split → apply
+//!   only the confirmed values → append schema-4 decisions and fold them into the learned store.
 //! - **styling** (T28–T31): extract each block's formatting → censor its text → interactive
 //!   per-block fine/weird review → append `styling.jsonl` records and the profile sidecar.
 //! - **snippet**: write the context-rich `.stencil.md` inventory + per-bracket snippet files.
@@ -23,12 +23,11 @@ use crate::cli::{ReviewArgs, Stage};
 use crate::detect::{Detection, Status, detect};
 use crate::extract;
 use crate::learn::{self, LearnedStore};
-use crate::model::{Block, Document, StyledBlock};
+use crate::model::Document;
+use crate::pages::PageSelection;
 use crate::render::{SnippetEntry, render};
 use crate::review::{self, ReviewFile};
 use crate::section::sections;
-use crate::style;
-use crate::style::review::{StyleVerdict, review as run_styling_review};
 
 /// Run the `review` subcommand.
 pub fn run(args: ReviewArgs) -> Result<()> {
@@ -41,6 +40,16 @@ pub fn run(args: ReviewArgs) -> Result<()> {
     }
 
     let extracted = extract::from_path(&args.input)?;
+    // Content-derived id: the key for this document's records and style profile (filenames collide
+    // across folders). Computed once so every stage records the same id.
+    let doc_id = crate::doc_id::doc_id(&extracted);
+    // Page scope for `--pages` (validated against the document's explicit page breaks).
+    let page_numbers = extract::page_numbers(&args.input)?;
+    let page_selection = parse_page_selection(&args, page_numbers.as_deref())?;
+    let page_scope = match (&page_selection, &page_numbers) {
+        (Some(selection), Some(pages)) => Some((pages.as_slice(), selection)),
+        _ => None,
+    };
     let parties = match &args.parties {
         Some(spec) => Some(PartyList::parse(spec)?),
         None => None,
@@ -51,7 +60,14 @@ pub fn run(args: ReviewArgs) -> Result<()> {
     // Produces `working` (only confirmed values censored) and the set of values the reviewer
     // rejected this run (so the snippet stage stays consistent with their decisions).
     let (working, rejected) = if stages.contains(&Stage::Censor) {
-        run_censor_stage(&args, &extracted, parties.as_ref(), &learned_allowed)?
+        run_censor_stage(
+            &args,
+            &extracted,
+            parties.as_ref(),
+            &learned_allowed,
+            &doc_id,
+            page_scope,
+        )?
     } else {
         (extracted.clone(), BTreeSet::new())
     };
@@ -65,11 +81,6 @@ pub fn run(args: ReviewArgs) -> Result<()> {
         allow: Some(&censor_allow),
     };
 
-    // ── Styling stage (T28–T31) ─────────────────────────────────────────────
-    if stages.contains(&Stage::Styling) {
-        run_styling_stage(&args, &options)?;
-    }
-
     // ── Snippet stage ───────────────────────────────────────────────────────
     if stages.contains(&Stage::Snippet) {
         write_snippet_outputs(&args, &extracted, &working, &options)?;
@@ -78,95 +89,48 @@ pub fn run(args: ReviewArgs) -> Result<()> {
     Ok(())
 }
 
-/// Run the interactive styling stage: extract each block's formatting, censor its text, review it
-/// block-by-block, then best-effort persist the records and the per-document profile sidecar.
+/// Parse and validate `--pages` against the document's pages. `None` when the flag is absent.
 ///
-/// Styling reads the `.docx` formatting directly, so it is a no-op for other inputs. The block
-/// text shown and logged is censored with `options` even when the censor stage was skipped (e.g.
-/// `--only styling`), since styling judgment never needs the real values.
-fn run_styling_stage(args: &ReviewArgs, options: &CensorOptions<'_>) -> Result<()> {
-    if !is_docx(&args.input) {
-        println!("Styling: only `.docx` carries styling, skipped.");
-        return Ok(());
-    }
-
-    let mut blocks = style::extract::from_path(&args.input)?;
-    if blocks.is_empty() {
-        println!("Styling: no blocks to review, skipped.");
-        return Ok(());
-    }
-    censor_block_text(&mut blocks, &args.input, options);
-
-    let profile = style::profile::build_profile(&blocks);
-    let decisions = run_styling_review(&blocks, &profile)?;
-
-    let weird = decisions
-        .iter()
-        .filter(|decision| matches!(decision.verdict, StyleVerdict::Weird { .. }))
-        .count();
-    println!(
-        "Styling: reviewed {} block(s) — {} fine, {weird} weird.",
-        decisions.len(),
-        decisions.len() - weird
-    );
-
-    persist_styling(args, &blocks, &profile, &decisions);
-    Ok(())
-}
-
-/// Censor each styled block's text (and so the neighbor context derived from it) in place, using
-/// the deterministic "censor everything" pass — a one-paragraph-per-block document keeps the
-/// censored text aligned 1:1 with the styled blocks.
-fn censor_block_text(blocks: &mut [StyledBlock], input: &Path, options: &CensorOptions<'_>) {
-    let text_doc = Document {
-        source: input.to_path_buf(),
-        blocks: blocks
-            .iter()
-            .map(|block| Block::Paragraph {
-                text: block.text.clone(),
-            })
-            .collect(),
-    };
-    let censored = censor::censor(&text_doc, options).document;
-    for (block, censored_block) in blocks.iter_mut().zip(censored.blocks) {
-        if let Block::Paragraph { text } = censored_block {
-            block.text = text;
-        }
-    }
-}
-
-/// Append the styling records and write the profile sidecar. Best-effort: a storage hiccup must
-/// never fail the review the user just completed, so problems are reported, not propagated.
-fn persist_styling(
+/// Errors when `--pages` is given for a page-less input (`.txt`) or requests a page beyond the
+/// document's explicit page breaks (e.g. page 2 of a `.docx` with no breaks).
+fn parse_page_selection(
     args: &ReviewArgs,
-    blocks: &[StyledBlock],
-    profile: &crate::model::DocumentStyleProfile,
-    decisions: &[style::review::StyleDecision],
-) {
-    let (Ok(log_path), Ok(profiles_dir)) = (
-        learn::styling_log_path(args.data_dir.as_deref(), args.styling_dir.as_deref()),
-        learn::styling_profiles_dir(args.data_dir.as_deref(), args.styling_dir.as_deref()),
-    ) else {
-        eprintln!("note: could not locate the styling data dir; styling was not saved");
-        return;
+    page_numbers: Option<&[u32]>,
+) -> Result<Option<PageSelection>> {
+    let Some(spec) = &args.pages else {
+        return Ok(None);
     };
-    if let Err(err) = style::record::persist(
-        &log_path,
-        &profiles_dir,
-        blocks,
-        profile,
-        decisions,
-        &args.input,
-    ) {
-        eprintln!("note: could not save styling records: {err}");
+    let selection = PageSelection::parse(spec)?;
+    let Some(pages) = page_numbers else {
+        bail!("--pages is only supported for .docx input (this document has no pages)");
+    };
+    let max_page = pages.iter().copied().max().unwrap_or(1);
+    if selection.max_page() > max_page {
+        bail!(
+            "--pages requested page {} but the document has explicit page breaks only up to page \
+             {max_page}; cannot scope by page",
+            selection.max_page()
+        );
     }
+    Ok(Some(selection))
 }
 
-/// Whether `path` has a `.docx` extension (case-insensitive).
-fn is_docx(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("docx"))
+/// Split items into (reviewed, auto-censored) by the page scope. An item is reviewed when any of
+/// its occurrences sits on a selected page; with no scope, every item is reviewed.
+fn scope_items(
+    items: Vec<censor::ReviewItem>,
+    page_scope: Option<(&[u32], &PageSelection)>,
+) -> (Vec<censor::ReviewItem>, Vec<censor::ReviewItem>) {
+    let Some((pages, selection)) = page_scope else {
+        return (items, Vec::new());
+    };
+    items.into_iter().partition(|item| {
+        item.occurrences.iter().any(|occurrence| {
+            pages
+                .get(occurrence.block_index)
+                .is_some_and(|&page| selection.contains(page))
+        })
+    })
 }
 
 /// The stages to run, in pipeline order, given the `--only`/`--skip` selections. `--only` and
@@ -191,13 +155,35 @@ fn run_censor_stage(
     extracted: &Document,
     parties: Option<&PartyList>,
     learned_allowed: &BTreeSet<String>,
+    doc_id: &str,
+    page_scope: Option<(&[u32], &PageSelection)>,
 ) -> Result<(Document, BTreeSet<String>)> {
     let options = CensorOptions {
         parties,
         allow: Some(learned_allowed),
     };
-    let items = censor::plan_review(extracted, &options);
-    let decisions = run_censor_review(extracted, &items)?;
+    let mut items = censor::plan_review(extracted, &options);
+    censor::tag_occurrence_languages(extracted, &mut items, super::lang_override(&args.lang));
+
+    // `--pages`: review only values on the selected pages; the rest are auto-censored (kept
+    // confirmed for safety, but `reviewed: false` so they are not logged as human labels).
+    let (reviewed_items, out_of_scope) = scope_items(items, page_scope);
+    let mut decisions = run_censor_review(extracted, &reviewed_items)?;
+    if !out_of_scope.is_empty() {
+        println!(
+            "Censor: {} value(s) on other pages auto-censored (not reviewed).",
+            out_of_scope.len()
+        );
+        decisions.extend(out_of_scope.iter().map(|item| {
+            CensorDecision::from_item(
+                item,
+                Verdict::Confirm {
+                    final_type: item.detected_type.label().to_string(),
+                },
+                false,
+            )
+        }));
+    }
     let working = censor::apply(extracted, &decisions, &options);
 
     // A value is "rejected" downstream (left in the clear in the snippet/styling stages) only when
@@ -228,7 +214,7 @@ fn run_censor_stage(
     );
 
     let source = extracted.source.display().to_string();
-    persist_decisions(args, &decisions, &source);
+    persist_decisions(args, &decisions, &source, doc_id);
     Ok((working, rejected))
 }
 
@@ -244,11 +230,11 @@ fn load_allowed(args: &ReviewArgs) -> BTreeSet<String> {
 ///
 /// Best-effort: a storage hiccup must never fail the review the user just completed, so problems
 /// are reported, not propagated. Only human-reviewed decisions are persisted.
-fn persist_decisions(args: &ReviewArgs, decisions: &[CensorDecision], source: &str) {
+fn persist_decisions(args: &ReviewArgs, decisions: &[CensorDecision], source: &str, doc_id: &str) {
     if !decisions.iter().any(|decision| decision.reviewed) {
         return;
     }
-    let records = censor::decision_records(decisions, source, learn::now_epoch_secs());
+    let records = censor::decision_records(decisions, source, doc_id, learn::now_epoch_secs());
     let (Ok(store_path), Ok(log_path)) = (
         learn::store_path(args.data_dir.as_deref(), args.censor_dir.as_deref()),
         learn::log_path(args.data_dir.as_deref(), args.censor_dir.as_deref()),
@@ -418,10 +404,7 @@ mod tests {
 
     #[test]
     fn skip_removes_the_named_stages() {
-        assert_eq!(
-            active_stages(&[], &[Stage::Styling]),
-            vec![Stage::Censor, Stage::Snippet]
-        );
+        assert_eq!(active_stages(&[], &[Stage::Snippet]), vec![Stage::Censor]);
     }
 
     #[test]
@@ -432,12 +415,45 @@ mod tests {
         );
     }
 
+    fn item_on_block(value: &str, block_index: usize) -> censor::ReviewItem {
+        censor::ReviewItem {
+            value: value.into(),
+            detected_type: crate::censor::ValueType::Entity,
+            method: "regex:test".into(),
+            occurrences: vec![crate::model::Occurrence {
+                block_index,
+                ..Default::default()
+            }],
+        }
+    }
+
     #[test]
-    fn is_docx_is_case_insensitive_and_extension_only() {
-        assert!(is_docx(Path::new("dir/Contract.docx")));
-        assert!(is_docx(Path::new("dir/Contract.DOCX")));
-        assert!(!is_docx(Path::new("dir/contract.txt")));
-        assert!(!is_docx(Path::new("docx")));
+    fn scope_items_partitions_reviewed_and_auto_censored_by_page() {
+        let pages = [1u32, 2, 3]; // block 0 → p1, block 1 → p2, block 2 → p3
+        let selection = PageSelection::parse("2").expect("valid");
+        let items = vec![
+            item_on_block("a", 0),
+            item_on_block("b", 1),
+            item_on_block("c", 2),
+        ];
+        let (reviewed, out_of_scope) = scope_items(items, Some((&pages, &selection)));
+        assert_eq!(
+            reviewed
+                .iter()
+                .map(|i| i.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"],
+            "only the page-2 value is reviewed",
+        );
+        assert_eq!(out_of_scope.len(), 2, "pages 1 and 3 are auto-censored");
+    }
+
+    #[test]
+    fn scope_items_reviews_everything_without_a_selection() {
+        let items = vec![item_on_block("a", 0), item_on_block("b", 1)];
+        let (reviewed, out_of_scope) = scope_items(items, None);
+        assert_eq!(reviewed.len(), 2);
+        assert!(out_of_scope.is_empty());
     }
 
     #[test]

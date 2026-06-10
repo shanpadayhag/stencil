@@ -33,20 +33,30 @@ pub fn from_path(path: &Path) -> Result<Vec<StyledBlock>> {
     Ok(styled_blocks(&docx))
 }
 
-/// Walk a parsed document into styled blocks, numbering them in emission order.
+/// Walk a parsed document into styled blocks, numbering them in emission order and stamping each
+/// with its 1-based page (advanced by explicit page breaks, like the text extractor).
 fn styled_blocks(docx: &Docx) -> Vec<StyledBlock> {
+    use crate::extract::docx::{paragraph_has_page_break, starts_new_page};
+
     let mut blocks = Vec::new();
+    let mut page = 1u32;
     for child in &docx.document.children {
         match child {
             DocumentChild::Paragraph(paragraph) => {
-                push_paragraph(&mut blocks, paragraph, false);
+                if starts_new_page(paragraph) {
+                    page += 1;
+                }
+                push_paragraph(&mut blocks, paragraph, false, page);
+                if paragraph_has_page_break(paragraph) {
+                    page += 1;
+                }
             }
             DocumentChild::Table(table) => {
                 for TableChild::TableRow(row) in &table.rows {
                     for TableRowChild::TableCell(cell) in &row.cells {
                         for content in &cell.children {
                             if let TableCellContent::Paragraph(paragraph) = content {
-                                push_paragraph(&mut blocks, paragraph, true);
+                                push_paragraph(&mut blocks, paragraph, true, page);
                             }
                         }
                     }
@@ -58,8 +68,9 @@ fn styled_blocks(docx: &Docx) -> Vec<StyledBlock> {
     blocks
 }
 
-/// Append the styled block for `paragraph` (unless it is empty), assigning the next index.
-fn push_paragraph(blocks: &mut Vec<StyledBlock>, paragraph: &Paragraph, in_table: bool) {
+/// Append the styled block for `paragraph` (unless it is empty), assigning the next index and
+/// its `page`.
+fn push_paragraph(blocks: &mut Vec<StyledBlock>, paragraph: &Paragraph, in_table: bool, page: u32) {
     let text = paragraph_text(paragraph);
     if text.trim().is_empty() {
         return;
@@ -75,6 +86,8 @@ fn push_paragraph(blocks: &mut Vec<StyledBlock>, paragraph: &Paragraph, in_table
         text,
         para,
         run: run_style(paragraph),
+        page,
+        ..Default::default() // lang tagged by the styling stage after extraction
     });
 }
 

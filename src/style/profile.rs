@@ -27,6 +27,7 @@ use crate::model::{
 ///     text: "x".into(),
 ///     para: ParaStyle::default(),
 ///     run: RunStyle { font: Some(font.into()), ..RunStyle::default() },
+///     ..Default::default()
 /// };
 /// let profile = build_profile(&[block(0, "Arial"), block(1, "Arial"), block(2, "Times")]);
 /// assert_eq!(profile.total_blocks, 3);
@@ -57,6 +58,7 @@ pub fn build_profile(blocks: &[StyledBlock]) -> DocumentStyleProfile {
 ///     text: "x".into(),
 ///     para: ParaStyle::default(),
 ///     run: RunStyle { font: Some(font.into()), ..RunStyle::default() },
+///     ..Default::default()
 /// };
 /// let blocks = [block(0, "Arial"), block(1, "Arial"), block(2, "Times")];
 /// let profile = build_profile(&blocks);
@@ -226,6 +228,7 @@ mod tests {
             text: "x".into(),
             para,
             run,
+            ..Default::default()
         }
     }
 

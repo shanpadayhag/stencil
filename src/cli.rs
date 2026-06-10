@@ -12,8 +12,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[command(
     name = "stencil",
     version,
-    about = "Interactively review a contract template: censor sensitive values, study document styling, and write a Markdown file for Claude Code.",
-    long_about = "Stencil's `review` command walks a contract template (.docx or .txt) through an interactive pipeline:\n\n  1. censor  — over-detect sensitive values; confirm / reject / re-type each one\n  2. styling — walk every block and flag formatting that looks wrong\n  3. snippet — write the context-rich Markdown + per-bracket snippet files for Claude Code\n\nThe review stages need an interactive terminal (TTY). IMPORTANT: censoring is a best-effort first-pass filter, NOT a guarantee of complete redaction — always review the output before sharing."
+    about = "Interactively review a contract template: censor sensitive values and write a Markdown file for Claude Code, or study document styling.",
+    long_about = "Stencil has two interactive commands over a contract template:\n\n  review <doc>  — over-detect sensitive values (confirm / reject / re-type / edit / split each), then write the context-rich Markdown + per-bracket snippet files for Claude Code\n  style  <doc>  — walk every block and flag formatting that looks wrong (fix it in Word, then run `review`)\n\nTypical flow: run `style` first, fix the flagged blocks, then `review`. Both commands need an interactive terminal (TTY). IMPORTANT: censoring is a best-effort first-pass filter, NOT a guarantee of complete redaction — always review the output before sharing."
 )]
 pub struct Cli {
     /// Which subcommand to run.
@@ -24,31 +24,31 @@ pub struct Cli {
 /// The available subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Review a template: censor, study styling, and write the Markdown snippet file.
+    /// Review a template: censor sensitive values and write the Markdown snippet file.
     Review(ReviewArgs),
+    /// Review document styling, surfacing formatting that looks wrong (fix it in Word, then
+    /// `review`). Records the per-block fine/weird labels for the future styling model.
+    Style(StyleArgs),
 }
 
-/// One stage of the `review` pipeline. Stages always run in pipeline order
-/// (`censor` → `styling` → `snippet`); `--only`/`--skip` just choose which run.
+/// One stage of the `review` pipeline. Stages run in pipeline order (`censor` → `snippet`);
+/// `--only`/`--skip` just choose which run. (Styling is its own `stencil style` command in v7.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Stage {
     /// Detect and interactively review sensitive values.
     Censor,
-    /// Walk every block and review its styling.
-    Styling,
     /// Write the Markdown inventory and per-bracket snippet files.
     Snippet,
 }
 
 impl Stage {
     /// Every stage, in pipeline order.
-    pub const ALL: [Stage; 3] = [Stage::Censor, Stage::Styling, Stage::Snippet];
+    pub const ALL: [Stage; 2] = [Stage::Censor, Stage::Snippet];
 
     /// The lowercase stage name as used on the command line.
     pub fn label(self) -> &'static str {
         match self {
             Stage::Censor => "censor",
-            Stage::Styling => "styling",
             Stage::Snippet => "snippet",
         }
     }
@@ -71,6 +71,16 @@ pub struct ReviewArgs {
     #[arg(long)]
     pub parties: Option<String>,
 
+    /// Language for the per-block training feature: `auto` (detect, default) or a forced code
+    /// such as `en` or `fr`.
+    #[arg(long, default_value = "auto")]
+    pub lang: String,
+
+    /// Scope the censor review to these pages (e.g. `2-3` or `1,3,5-7`); other pages are still
+    /// censored, just not reviewed. Requires explicit `.docx` page breaks.
+    #[arg(long)]
+    pub pages: Option<String>,
+
     /// Run only these stages (comma-separated or repeated). Mutually exclusive with `--skip`.
     #[arg(long, value_enum, value_delimiter = ',', conflicts_with = "skip")]
     pub only: Vec<Stage>,
@@ -88,13 +98,33 @@ pub struct ReviewArgs {
     #[arg(long)]
     pub censor_dir: Option<PathBuf>,
 
-    /// Override the styling store location (else `<data_dir>/styling/`; env `STENCIL_STYLING_DIR`).
-    #[arg(long)]
-    pub styling_dir: Option<PathBuf>,
-
     /// Overwrite existing output/snippet files instead of refusing.
     #[arg(long)]
     pub force: bool,
+}
+
+/// Arguments for `stencil style` — the standalone styling review (v7).
+#[derive(Debug, Args)]
+pub struct StyleArgs {
+    /// Input template to review (`.docx`; styling is `.docx`-only).
+    pub input: PathBuf,
+
+    /// Language for the per-block training feature: `auto` (detect, default) or a forced code.
+    #[arg(long, default_value = "auto")]
+    pub lang: String,
+
+    /// Scope the review to these pages (e.g. `2-3` or `1,3,5-7`). Requires explicit page breaks.
+    #[arg(long)]
+    pub pages: Option<String>,
+
+    /// Root directory for the learning stores (default: `$XDG_CONFIG_HOME/stencil` or
+    /// `~/.config/stencil`).
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
+
+    /// Override the styling store location (else `<data_dir>/styling/`; env `STENCIL_STYLING_DIR`).
+    #[arg(long)]
+    pub styling_dir: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -121,7 +151,9 @@ mod tests {
         ])
         .expect("valid review invocation should parse");
 
-        let Command::Review(args) = cli.command;
+        let Command::Review(args) = cli.command else {
+            panic!("expected the review subcommand");
+        };
         assert_eq!(args.input, PathBuf::from("contract.docx"));
         assert!(args.force);
         assert_eq!(args.parties.as_deref(), Some("Acme,Jane Doe"));
@@ -134,7 +166,9 @@ mod tests {
     fn parses_only_as_comma_list() {
         let cli = Cli::try_parse_from(["stencil", "review", "c.docx", "--only", "censor,snippet"])
             .expect("comma-separated stages should parse");
-        let Command::Review(args) = cli.command;
+        let Command::Review(args) = cli.command else {
+            panic!("expected the review subcommand");
+        };
         assert_eq!(args.only, vec![Stage::Censor, Stage::Snippet]);
     }
 

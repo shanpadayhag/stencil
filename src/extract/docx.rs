@@ -13,8 +13,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use docx_rs::{
-    DocumentChild, Paragraph, ParagraphChild, RunChild, TableCell, TableCellContent, TableChild,
-    TableRowChild, read_docx,
+    Break, DocumentChild, Paragraph, ParagraphChild, Run, RunChild, TableCell, TableCellContent,
+    TableChild, TableRowChild, read_docx,
 };
 
 use crate::model::{Block, Cell, Document};
@@ -24,29 +24,91 @@ use crate::model::{Block, Cell, Document};
 /// # Errors
 /// Returns an error if the file cannot be read or is not a valid `.docx`.
 pub fn from_path(path: &Path) -> Result<Document> {
+    let blocks = paged_blocks(path)?
+        .into_iter()
+        .map(|(block, _)| block)
+        .collect();
+    Ok(Document {
+        source: path.to_path_buf(),
+        blocks,
+    })
+}
+
+/// The 1-based page number of each block, parallel to [`from_path`]'s blocks.
+///
+/// Pages are delimited by **explicit** page breaks — a manual page break (`<w:br w:type="page"/>`)
+/// or a paragraph's `pageBreakBefore`. Automatic (rendered) pagination is not in the file and is
+/// not inferred, so a document with no explicit breaks is entirely page 1.
+///
+/// # Errors
+/// Returns an error if the file cannot be read or is not a valid `.docx`.
+pub fn page_numbers(path: &Path) -> Result<Vec<u32>> {
+    Ok(paged_blocks(path)?
+        .into_iter()
+        .map(|(_, page)| page)
+        .collect())
+}
+
+/// Walk the document once, returning each kept block with its 1-based page number. A page break
+/// on a dropped (empty) paragraph still advances the page for the blocks that follow.
+fn paged_blocks(path: &Path) -> Result<Vec<(Block, u32)>> {
     let bytes = fs::read(path).with_context(|| format!("failed to read `{}`", path.display()))?;
     let docx = read_docx(&bytes)
         .map_err(|err| anyhow!("failed to parse .docx `{}`: {err:?}", path.display()))?;
 
     let mut blocks = Vec::new();
+    let mut page = 1u32;
     for child in &docx.document.children {
         match child {
             DocumentChild::Paragraph(paragraph) => {
+                if starts_new_page(paragraph) {
+                    page += 1;
+                }
                 if let Some(block) = block_from_paragraph(paragraph) {
-                    blocks.push(block);
+                    blocks.push((block, page));
+                }
+                if paragraph_has_page_break(paragraph) {
+                    page += 1;
                 }
             }
             DocumentChild::Table(table) => {
-                blocks.push(block_from_table(&table.rows));
+                blocks.push((block_from_table(&table.rows), page));
             }
             _ => {}
         }
     }
+    Ok(blocks)
+}
 
-    Ok(Document {
-        source: path.to_path_buf(),
-        blocks,
+/// Whether a paragraph carries `pageBreakBefore` — it (and what follows) is on the next page.
+pub(crate) fn starts_new_page(paragraph: &Paragraph) -> bool {
+    paragraph.property.page_break_before == Some(true)
+}
+
+/// Whether a paragraph contains a manual page break in one of its runs.
+pub(crate) fn paragraph_has_page_break(paragraph: &Paragraph) -> bool {
+    paragraph.children.iter().any(|child| match child {
+        ParagraphChild::Run(run) => run_has_page_break(run),
+        _ => false,
     })
+}
+
+/// Whether a run contains a `<w:br w:type="page"/>`.
+fn run_has_page_break(run: &Run) -> bool {
+    run.children
+        .iter()
+        .any(|child| matches!(child, RunChild::Break(brk) if is_page_break(brk)))
+}
+
+/// Whether a break is a page break. The `break_type` field is private, but `Break` serializes as
+/// `{"breakType":"page"}`, so we read it via serde (the same introspection the styling stage uses).
+fn is_page_break(brk: &Break) -> bool {
+    serde_json::to_value(brk)
+        .ok()
+        .as_ref()
+        .and_then(|value| value.get("breakType"))
+        .and_then(|kind| kind.as_str())
+        .is_some_and(|kind| kind == "page")
 }
 
 /// Convert a paragraph to a heading or paragraph block, dropping empty body paragraphs.
@@ -196,6 +258,55 @@ mod tests {
 
         let doc = round_trip(docx, "empty");
         assert_eq!(doc.blocks.len(), 2);
+    }
+
+    #[test]
+    fn page_numbers_track_manual_break_and_page_break_before() {
+        use docx_rs::BreakType;
+        let docx = Docx::new()
+            // page 1: a plain paragraph, then one ending in a manual page break.
+            .add_paragraph(para("page one"))
+            .add_paragraph(
+                DocxParagraph::new()
+                    .add_run(Run::new().add_text("still one").add_break(BreakType::Page)),
+            )
+            // page 2 (after the manual break).
+            .add_paragraph(para("page two"))
+            // page 3 (this paragraph carries pageBreakBefore).
+            .add_paragraph(
+                DocxParagraph::new()
+                    .page_break_before(true)
+                    .add_run(Run::new().add_text("page three")),
+            );
+
+        let path =
+            std::env::temp_dir().join(format!("stencil_t42_pages_{}.docx", std::process::id()));
+        let file = fs::File::create(&path).expect("create temp docx");
+        docx.build().pack(file).expect("pack docx");
+        let pages = page_numbers(&path).expect("page numbers");
+        let doc = from_path(&path).expect("read docx");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(doc.blocks.len(), 4, "all four paragraphs kept");
+        assert_eq!(
+            pages,
+            vec![1, 1, 2, 3],
+            "manual break and pageBreakBefore advance the page"
+        );
+    }
+
+    #[test]
+    fn no_breaks_means_everything_is_page_one() {
+        let docx = Docx::new()
+            .add_paragraph(para("alpha"))
+            .add_paragraph(para("beta"));
+        let path =
+            std::env::temp_dir().join(format!("stencil_t42_nobreak_{}.docx", std::process::id()));
+        let file = fs::File::create(&path).expect("create temp docx");
+        docx.build().pack(file).expect("pack docx");
+        let pages = page_numbers(&path).expect("page numbers");
+        let _ = fs::remove_file(&path);
+        assert_eq!(pages, vec![1, 1]);
     }
 
     #[test]

@@ -94,10 +94,11 @@ pub enum Block {
 /// `heading` and `list_item` reflect the paragraph's semantic role; `table_cell` is a
 /// plain paragraph inside a table cell (a heading or list item inside a table keeps its
 /// role and is flagged by [`StyledBlock::in_table`] instead).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockKind {
     /// A body paragraph.
+    #[default]
     Paragraph,
     /// A heading paragraph (carries [`StyledBlock::heading_level`]).
     Heading,
@@ -144,10 +145,11 @@ impl BlockKind {
 ///     heading_level: None,
 ///     shown_context: "Pay REDACTED_MONEY_001 now.".into(),
 ///     block_context: "The buyer shall pay REDACTED_MONEY_001 now.".into(),
+///     ..Default::default()
 /// };
 /// assert_eq!(&occ.shown_context[occ.start..occ.end], "REDACTED_MONEY_001");
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Occurrence {
     /// Index of the containing [`Block`] in [`Document::blocks`].
     pub block_index: usize,
@@ -166,6 +168,10 @@ pub struct Occurrence {
     pub shown_context: String,
     /// The whole-paragraph window recorded as the richer `block_context` feature.
     pub block_context: String,
+    /// ISO language code of the containing block (a v7 training feature; empty until tagged).
+    pub lang: String,
+    /// Language-detection confidence in 0..=1 (`0.0` for a fallback/untagged occurrence).
+    pub lang_confidence: f32,
 }
 
 /// Paragraph indentation, in twips (1/1440 inch); `None` where the property is unset.
@@ -244,7 +250,7 @@ pub struct RunStyle {
 ///
 /// Produced by [`crate::style::extract`]. The [`text`](StyledBlock::text) is the block's
 /// visible text; it is censored before being shown or logged (see the styling stage).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct StyledBlock {
     /// Position of this block among the emitted styled blocks, 0-based.
     pub block_index: usize,
@@ -261,6 +267,15 @@ pub struct StyledBlock {
     pub para: ParaStyle,
     /// Run-level styling.
     pub run: RunStyle,
+    /// ISO language code detected for this block (a v7 training feature; empty until tagged).
+    #[serde(default)]
+    pub lang: String,
+    /// Language-detection confidence in 0..=1 (`0.0` for a fallback/untagged block).
+    #[serde(default)]
+    pub lang_confidence: f32,
+    /// 1-based page (from explicit `.docx` page breaks) for `--pages` scoping; `0` if untracked.
+    #[serde(default)]
+    pub page: u32,
 }
 
 /// How many blocks use a given paragraph style id (`None` = unstyled/inherited).

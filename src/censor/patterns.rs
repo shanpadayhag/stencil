@@ -77,6 +77,54 @@ static PERCENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&pattern).expect("static regex `PERCENT` is valid")
 });
 
+// ── French detectors (v7) ───────────────────────────────────────────────────
+// These run alongside the English detectors on every block (detection is recall-first and not
+// gated by the block's detected language). They add French money/percent/date forms; structured
+// values (email, IBAN, Luhn cards) are already language-agnostic.
+
+/// French base number words; hyphen/space/`et` joins in [`number_phrase_fr`] cover the compound
+/// forms (`dix-sept`, `soixante-dix`, `quatre-vingts`, `deux mille`).
+const NUMBER_WORD_FR: &str = r"(?:une?|deux|trois|quatre|cinq|six|sept|huit|neuf|dix|onze|douze|treize|quatorze|quinze|seize|vingts?|trente|quarante|cinquante|soixante|cents?|mille|millions?|milliards?)";
+
+/// A spelled-out French number: one or more [`NUMBER_WORD_FR`] joined by spaces, hyphens, or `et`.
+fn number_phrase_fr() -> String {
+    format!(r"\b{NUMBER_WORD_FR}(?:[ \t\-]+(?:et[ \t]+)?{NUMBER_WORD_FR})*")
+}
+
+/// A French-formatted number: space/NBSP thousands separators and a comma decimal
+/// (`1 000,50`, `10,5`, `42`). `\s` covers the non-breaking space French typography uses.
+const FRENCH_NUMBER: &str = r"[0-9]{1,3}(?:\s[0-9]{3})*(?:,[0-9]+)?";
+
+/// French monetary amounts: a French-formatted number or spelled-out phrase with a euro/dollar/
+/// franc marker — `1 000,50 €`, `€ 1 000`, `deux mille euros`.
+static MONEY_FR: LazyLock<Regex> = LazyLock::new(|| {
+    let pattern = format!(
+        r"(?i)(?:{FRENCH_NUMBER}\s?(?:€|euros?|dollars?|francs?|centimes?))|(?:€\s?{FRENCH_NUMBER})|(?:{}\s+(?:euros?|dollars?|francs?|centimes?)\b)",
+        number_phrase_fr()
+    );
+    Regex::new(&pattern).expect("static regex `MONEY_FR` is valid")
+});
+
+/// French percentages: spelled-out `dix pour cent` (incl. the `dix pour cent (10 %)` form), or
+/// numeric with the French space-before-`%` and comma decimal (`10 %`, `10,5 %`).
+static PERCENT_FR: LazyLock<Regex> = LazyLock::new(|| {
+    let pattern = format!(
+        r"(?i)(?:{}\s+pour\s?cent(?:\s*\([^)]*%\s*\))?)|(?:{FRENCH_NUMBER}\s?%)",
+        number_phrase_fr()
+    );
+    Regex::new(&pattern).expect("static regex `PERCENT_FR` is valid")
+});
+
+/// French dates: `le 15 janvier 2024`, `1er février 2024`, `15 déc 2024` — accented and accentless
+/// month spellings.
+static DATE_FR: LazyLock<Regex> = LazyLock::new(|| {
+    // The leading `le` is context, not part of the date, so it is not captured.
+    Regex::new(
+        r"(?i)\b[0-9]{1,2}(?:er)?\s+(?:janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre)\.?\s+[0-9]{2,4}\b",
+    )
+    .expect("static regex `DATE_FR` is valid")
+});
+
 /// Lower and upper bounds on the digit count of a plausible phone number.
 const PHONE_MIN_DIGITS: usize = 7;
 const PHONE_MAX_DIGITS: usize = 15;
@@ -103,6 +151,11 @@ pub fn find_candidates(text: &str) -> Vec<PatternMatch> {
     push_all(&mut matches, &PERCENT, text, ValueType::Percent);
     push_all(&mut matches, &DATE, text, ValueType::Date);
     push_all(&mut matches, &ACCOUNT, text, ValueType::Account);
+
+    // French detectors, alongside the English ones.
+    push_all(&mut matches, &MONEY_FR, text, ValueType::Money);
+    push_all(&mut matches, &PERCENT_FR, text, ValueType::Percent);
+    push_all(&mut matches, &DATE_FR, text, ValueType::Date);
 
     push_phones(&mut matches, text);
     push_cards(&mut matches, text);
@@ -243,13 +296,17 @@ mod tests {
 
     #[test]
     fn percent_matches_combined_word_and_parenthetical_as_one_span() {
-        // The whole "ten percent (10%)" is one span, not "ten percent" + "10%" separately.
-        assert_eq!(
-            matched(
-                "Tenant has been overcharged by ten percent (10%) or more",
-                ValueType::Percent
-            ),
-            vec!["ten percent (10%)"]
+        // The English detector keeps "ten percent (10%)" whole — not split into "ten percent".
+        // (The French numeric detector independently also matches the inner "10%"; the pipeline's
+        // overlap resolution keeps the longer combined span.)
+        let percents = matched(
+            "Tenant has been overcharged by ten percent (10%) or more",
+            ValueType::Percent,
+        );
+        assert!(percents.contains(&"ten percent (10%)"));
+        assert!(
+            !percents.contains(&"ten percent"),
+            "the word form is not split off"
         );
     }
 
@@ -338,6 +395,57 @@ mod tests {
 
     #[test]
     fn plain_text_has_no_candidates() {
+        assert!(find_candidates("just some ordinary words here").is_empty());
+    }
+
+    // ── French detectors ─────────────────────────────────────────────────────
+
+    #[test]
+    fn french_money_numeric_and_spelled_out() {
+        assert!(matched("un acompte de 1 000,50 €", ValueType::Money).contains(&"1 000,50 €"));
+        assert!(matched("payer deux mille euros", ValueType::Money).contains(&"deux mille euros"));
+        assert!(matched("environ € 500", ValueType::Money).contains(&"€ 500"));
+    }
+
+    #[test]
+    fn french_percent_numeric_and_spelled_out() {
+        assert!(matched("un taux de 10 %", ValueType::Percent).contains(&"10 %"));
+        assert!(matched("jusqu'à 10,5 %", ValueType::Percent).contains(&"10,5 %"));
+        assert!(matched("majoré de dix pour cent", ValueType::Percent).contains(&"dix pour cent"));
+    }
+
+    #[test]
+    fn french_percent_combined_word_and_parenthetical() {
+        assert!(
+            matched(
+                "surfacturé de dix pour cent (10 %) ou plus",
+                ValueType::Percent
+            )
+            .contains(&"dix pour cent (10 %)")
+        );
+    }
+
+    #[test]
+    fn french_dates_with_accented_months() {
+        assert!(
+            matched("le 15 janvier 2024 au plus tard", ValueType::Date)
+                .contains(&"15 janvier 2024")
+        );
+        assert!(
+            matched("signé le 1er février 2024", ValueType::Date).contains(&"1er février 2024")
+        );
+        assert!(matched("avant le 3 décembre 2024", ValueType::Date).contains(&"3 décembre 2024"));
+    }
+
+    #[test]
+    fn english_behaviour_unchanged_by_french_detectors() {
+        // The French additions must not disturb the English matches.
+        assert!(matched("a fee of 10% applies", ValueType::Percent).contains(&"10%"));
+        assert!(
+            matched("pay two thousand dollars now", ValueType::Money)
+                .contains(&"two thousand dollars")
+        );
+        assert!(matched("due 2026-06-04 sharp", ValueType::Date).contains(&"2026-06-04"));
         assert!(find_candidates("just some ordinary words here").is_empty());
     }
 }

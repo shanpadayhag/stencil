@@ -1,9 +1,9 @@
-//! End-to-end CLI tests for the `review` command surface.
+//! End-to-end CLI tests for the `review` and `style` command surface.
 //!
-//! These cover the command-line contract — the `review` command exists with its flags, the
-//! removed `detect`/`restore` commands are gone, `--only`/`--skip` are mutually exclusive, and a
-//! non-TTY invocation is refused. The interactive pipeline halves that don't need a PTY are
-//! exercised end-to-end in `tests/review_pipeline.rs`.
+//! These cover the command-line contract — the `review` and `style` commands exist with their
+//! flags, the removed `detect`/`restore` commands are gone, `--only`/`--skip` are mutually
+//! exclusive, and a non-TTY invocation of either is refused. The interactive pipeline halves that
+//! don't need a PTY are exercised end-to-end in `tests/review_pipeline.rs`.
 
 use std::fs;
 use std::path::PathBuf;
@@ -77,6 +77,32 @@ fn detect_and_restore_are_unknown_commands() {
             .status
             .success(),
         "the restore command was removed in v6"
+    );
+}
+
+#[test]
+fn style_help_lists_its_flags() {
+    let output = run(&["style", "--help"]);
+    assert!(output.status.success(), "style --help should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--pages") && stdout.contains("--lang"),
+        "style --help lists --pages and --lang; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn style_without_a_tty_is_refused() {
+    // The TTY gate fires before the file is read, so a non-existent path is fine here.
+    let output = run(&["style", "contract.docx"]);
+    assert!(
+        !output.status.success(),
+        "style must refuse to run without an interactive terminal"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("interactive terminal"),
+        "should explain the TTY requirement; got:\n{stderr}"
     );
 }
 

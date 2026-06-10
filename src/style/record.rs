@@ -26,6 +26,7 @@ pub fn build_record(
     relative: &RelativeFeatures,
     context: NeighborContext,
     source: &str,
+    doc_id: &str,
     verdict: &StyleVerdict,
 ) -> StylingRecord {
     let (verdict_label, category, note) = match verdict {
@@ -36,6 +37,9 @@ pub fn build_record(
     StylingRecord {
         schema: learn::styling_schema(),
         source: source.to_string(),
+        doc_id: doc_id.to_string(),
+        lang: block.lang.clone(),
+        lang_confidence: block.lang_confidence,
         block_index: block.block_index,
         block_kind: block.block_kind.as_str().to_string(),
         heading_level: block.heading_level,
@@ -75,6 +79,7 @@ pub fn persist(
     profile: &DocumentStyleProfile,
     decisions: &[StyleDecision],
     source: &Path,
+    doc_id: &str,
 ) -> Result<PathBuf> {
     let source_label = source.to_string_lossy();
     for decision in decisions {
@@ -86,47 +91,37 @@ pub fn persist(
         };
         let relative = crate::style::profile::relative_features(block, profile);
         let context = neighbor_context(blocks, decision.block_index);
-        let record = build_record(block, &relative, context, &source_label, &decision.verdict);
+        let record = build_record(
+            block,
+            &relative,
+            context,
+            &source_label,
+            doc_id,
+            &decision.verdict,
+        );
         learn::append_styling(log_path, &record)?;
     }
-    write_profile_sidecar(profiles_dir, source, profile)
+    write_profile_sidecar(profiles_dir, doc_id, profile)
 }
 
-/// Write `profile` as a pretty-printed JSON sidecar named after `source`, returning its path.
+/// Write `profile` as a pretty-printed JSON sidecar named by the content-derived `doc_id`,
+/// returning its path. Keying by id (not filename) avoids clobbering when same-named documents
+/// from different folders are processed.
 ///
 /// # Errors
 /// Returns an error if the directory or file cannot be written.
 pub fn write_profile_sidecar(
     profiles_dir: &Path,
-    source: &Path,
+    doc_id: &str,
     profile: &DocumentStyleProfile,
 ) -> Result<PathBuf> {
     std::fs::create_dir_all(profiles_dir)
         .with_context(|| format!("failed to create `{}`", profiles_dir.display()))?;
-    let path = profiles_dir.join(format!("{}.json", source_key(source)));
+    let path = profiles_dir.join(format!("{doc_id}.json"));
     let json =
         serde_json::to_string_pretty(profile).context("failed to serialize style profile")?;
     std::fs::write(&path, json).with_context(|| format!("failed to write `{}`", path.display()))?;
     Ok(path)
-}
-
-/// A filesystem-safe sidecar key for a source path: its file name with every non-alphanumeric
-/// character folded to `_`. Empty or odd paths fall back to `profile`.
-fn source_key(source: &Path) -> String {
-    let stem = source
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_default();
-    let key: String = stem
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect();
-    let trimmed = key.trim_matches('_');
-    if trimmed.is_empty() {
-        "profile".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 /// Map the in-memory paragraph styling onto the persisted [`ParaStyle`].
@@ -197,6 +192,7 @@ mod tests {
             text: text.into(),
             para,
             run,
+            ..Default::default()
         }
     }
 
@@ -215,6 +211,7 @@ mod tests {
             &relative,
             NeighborContext::default(),
             "c.docx",
+            "doc-id-test",
             &StyleVerdict::Fine,
         );
         assert_eq!(record.verdict, "fine");
@@ -252,6 +249,7 @@ mod tests {
             &relative,
             NeighborContext::default(),
             "c.docx",
+            "doc-id-test",
             &StyleVerdict::Weird {
                 category: "wrong-style-for-role".into(),
                 note: Some("title as paragraph".into()),
@@ -290,6 +288,7 @@ mod tests {
             &relative,
             NeighborContext::default(),
             "c.docx",
+            "doc-id-test",
             &StyleVerdict::Fine,
         );
         assert_eq!(record.para.numbering, None);
@@ -327,16 +326,6 @@ mod tests {
 
         let last = neighbor_context(&blocks, 2);
         assert_eq!(last.next_text, "");
-    }
-
-    #[test]
-    fn source_key_is_filesystem_safe() {
-        assert_eq!(
-            source_key(Path::new("/a/b/Contract v2.docx")),
-            "Contract_v2_docx"
-        );
-        assert_eq!(source_key(Path::new("plain.txt")), "plain_txt");
-        assert_eq!(source_key(Path::new("/")), "profile");
     }
 
     #[test]
@@ -382,8 +371,14 @@ mod tests {
             &profile,
             &decisions,
             Path::new("c.docx"),
+            "deadbeefcafe0001",
         )
         .expect("persist");
+        assert_eq!(
+            sidecar.file_name().unwrap().to_string_lossy(),
+            "deadbeefcafe0001.json",
+            "sidecar is keyed by the content id, not the filename"
+        );
 
         let log = std::fs::read_to_string(&log_path).expect("read log");
         let lines: Vec<&str> = log.lines().collect();

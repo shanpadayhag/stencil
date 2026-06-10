@@ -14,6 +14,8 @@ dotenvy = "0.15.7"
 regex = "1.12.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+sha2 = "0.11.0"
+whatlang = "0.18.0"
 
 # Tuned for runtime speed and a small binary on low-end targets.
 [profile.release]

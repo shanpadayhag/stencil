@@ -439,6 +439,7 @@ mod tests {
             text: "x".into(),
             para: ParaStyle::default(),
             run: RunStyle::default(),
+            ..Default::default()
         };
         assert_eq!(inline_style(&block), "(inherited)");
     }

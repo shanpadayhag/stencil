@@ -38,6 +38,29 @@ pub fn from_path(path: &Path) -> Result<Document> {
     }
 }
 
+/// The 1-based page number of each block (parallel to [`from_path`]'s blocks), or `None` for a
+/// format without pages (`.txt`). Only explicit `.docx` page breaks delimit pages — see
+/// [`docx::page_numbers`].
+///
+/// # Errors
+/// Returns an error for an unsupported/missing extension, or if the reader fails.
+pub fn page_numbers(path: &Path) -> Result<Option<Vec<u32>>> {
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase);
+
+    match extension.as_deref() {
+        Some("txt") => Ok(None),
+        Some("docx") => Ok(Some(docx::page_numbers(path)?)),
+        Some(other) => bail!("unsupported input extension `.{other}` (expected .txt or .docx)"),
+        None => bail!(
+            "input `{}` has no file extension (expected .txt or .docx)",
+            path.display()
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
