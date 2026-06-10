@@ -5,15 +5,20 @@
 //! precedence** with **longest-match-wins** so every character is replaced at most
 //! once, and dedups by exact value (one value → one stable placeholder).
 
+pub mod edit;
 pub mod names;
 pub mod patterns;
 pub mod review;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::detect::paired_spans;
-use crate::learn::{DecisionRecord, LearnedStore, block_window, decision_schema, sentence_window};
-use crate::model::{Block, Cell, Document, MAPPING_VERSION, Mapping, MappingEntry};
+use crate::learn::{
+    DecisionRecord, LearnedStore, block_window_at, decision_schema, sentence_window_at,
+};
+use crate::model::{
+    Block, BlockKind, Cell, Document, MAPPING_VERSION, Mapping, MappingEntry, Occurrence,
+};
 
 pub use names::PartyList;
 
@@ -332,6 +337,10 @@ fn method_label(source: DetectSource, value_type: ValueType) -> String {
 
 /// A distinct value surfaced for interactive review, with the metadata the reviewer sees and
 /// the decision log records.
+///
+/// All occurrences of one value are grouped here (deduped by exact string). The default review
+/// decides the whole group at once; splitting a group (v7) decides each [`Occurrence`] on its
+/// own. The group is never empty — it is built from at least one detected occurrence.
 #[derive(Debug, Clone)]
 pub struct ReviewItem {
     /// The real value to decide on.
@@ -340,12 +349,34 @@ pub struct ReviewItem {
     pub detected_type: ValueType,
     /// How it was detected (`party-list` / `regex:<kind>` / `heuristic`).
     pub method: String,
+    /// Every occurrence of the value across the document, in first-seen order.
+    pub occurrences: Vec<Occurrence>,
+}
+
+impl ReviewItem {
     /// How many times the value occurs across the document.
-    pub occurrences: usize,
-    /// Sentence-ish window of the first occurrence — what the reviewer sees (label provenance).
-    pub shown_context: String,
-    /// The paragraph of the first occurrence — the richer logged feature.
-    pub block_context: String,
+    pub fn occurrence_count(&self) -> usize {
+        self.occurrences.len()
+    }
+
+    /// The distinct block kinds the value appears in — drives the mixed-context split hint (v7).
+    pub fn block_kinds(&self) -> BTreeSet<BlockKind> {
+        self.occurrences.iter().map(|o| o.block_kind).collect()
+    }
+
+    /// The first occurrence's sentence window — what a whole-group review shows and records.
+    pub fn first_shown_context(&self) -> &str {
+        self.occurrences
+            .first()
+            .map_or("", |o| o.shown_context.as_str())
+    }
+
+    /// The first occurrence's paragraph window — the whole-group `block_context`.
+    pub fn first_block_context(&self) -> &str {
+        self.occurrences
+            .first()
+            .map_or("", |o| o.block_context.as_str())
+    }
 }
 
 /// The reviewer's verdict for a value.
@@ -357,30 +388,153 @@ pub enum Verdict {
     Reject,
 }
 
-/// One value's resolved outcome. `reviewed` is false for items auto-confirmed when the user
-/// quits early: kept censored for safety, but not a human label (excluded from log/store).
+/// What a decision covers: a whole value-group, or a single occurrence carved out by a split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionScope {
+    /// Every occurrence of the value, decided together (the default review).
+    Group {
+        /// How many occurrences the group covers.
+        occurrences: u32,
+    },
+    /// One occurrence (from a split), with its precise location for offset-based censoring.
+    Occurrence(Box<Occurrence>),
+}
+
+/// One value's resolved outcome — self-contained, so logging no longer needs the parent
+/// [`ReviewItem`] (a v7 add-missed-value decision has no parent item, and a split yields several
+/// occurrence-scoped decisions from one item).
+///
+/// `reviewed` is false for items auto-confirmed when the user quits early: kept censored for
+/// safety, but not a human label (excluded from log/store).
 #[derive(Debug, Clone)]
 pub struct CensorDecision {
-    /// The value decided on.
+    /// The value decided on (the edited string when [`span_edited`](CensorDecision::span_edited)).
     pub value: String,
     /// The detector's guessed type, carried for logging.
     pub detected_type: ValueType,
+    /// How the value was detected (`party-list` / `regex:<kind>` / `manual` for added values).
+    pub method: String,
     /// The verdict.
     pub verdict: Verdict,
     /// Whether a human explicitly decided this (vs auto-defaulted on quit).
     pub reviewed: bool,
+    /// Whether this decides the whole value-group or a single split-out occurrence.
+    pub scope: DecisionScope,
+    /// The sentence window recorded for this decision (edited when
+    /// [`context_edited`](CensorDecision::context_edited)).
+    pub shown_context: String,
+    /// The paragraph window recorded for this decision.
+    pub block_context: String,
+    /// The reviewer adjusted the censored span's boundaries (the value was retargeted).
+    pub span_edited: bool,
+    /// The reviewer corrected the recorded context window.
+    pub context_edited: bool,
+    /// The reviewer added this value; the detector did not flag it.
+    pub user_added: bool,
 }
 
-/// Every text field of a document, in order (headings, paragraphs, then table cells).
-fn text_fields(document: &Document) -> Vec<&str> {
+impl CensorDecision {
+    /// A whole-group decision built from a reviewed item, using its first occurrence's context.
+    /// Edit/add flows tweak the result before recording it.
+    pub fn from_item(item: &ReviewItem, verdict: Verdict, reviewed: bool) -> Self {
+        Self {
+            value: item.value.clone(),
+            detected_type: item.detected_type,
+            method: item.method.clone(),
+            verdict,
+            reviewed,
+            scope: DecisionScope::Group {
+                occurrences: item.occurrence_count() as u32,
+            },
+            shown_context: item.first_shown_context().to_string(),
+            block_context: item.first_block_context().to_string(),
+            span_edited: false,
+            context_edited: false,
+            user_added: false,
+        }
+    }
+
+    /// An occurrence-scoped decision carved from a split: it covers exactly `occurrence` (its
+    /// location drives the offset-based censoring in [`apply`]) and logs that occurrence's context.
+    pub fn from_occurrence(
+        value: &str,
+        detected_type: ValueType,
+        method: &str,
+        occurrence: Occurrence,
+        verdict: Verdict,
+    ) -> Self {
+        Self {
+            value: value.to_string(),
+            detected_type,
+            method: method.to_string(),
+            verdict,
+            reviewed: true,
+            shown_context: occurrence.shown_context.clone(),
+            block_context: occurrence.block_context.clone(),
+            scope: DecisionScope::Occurrence(Box::new(occurrence)),
+            span_edited: false,
+            context_edited: false,
+            user_added: false,
+        }
+    }
+
+    /// How many occurrences this decision covers (a split occurrence covers one).
+    pub fn occurrences(&self) -> u32 {
+        match &self.scope {
+            DecisionScope::Group { occurrences } => *occurrences,
+            DecisionScope::Occurrence(_) => 1,
+        }
+    }
+
+    /// Whether this decision's value was supplied by the reviewer (edited span or added value)
+    /// rather than found by the detector — such values are censored by literal search in
+    /// [`apply`], since the detector won't re-find them.
+    fn is_user_supplied(&self) -> bool {
+        self.span_edited || self.user_added
+    }
+}
+
+/// A located text field of a document: one heading/paragraph, or one table cell, tagged with
+/// where it sits and its structural kind. Table cells fold into [`BlockKind::TableCell`];
+/// every paragraph (list item or not) folds into [`BlockKind::Paragraph`] (v7).
+struct FieldRef<'a> {
+    block_index: usize,
+    cell: Option<(usize, usize)>,
+    block_kind: BlockKind,
+    heading_level: Option<u8>,
+    text: &'a str,
+}
+
+/// Every text field of a document, in order (headings, paragraphs, then table cells), each
+/// carrying its location and structural kind so detected occurrences can record them.
+fn document_fields(document: &Document) -> Vec<FieldRef<'_>> {
     let mut fields = Vec::new();
-    for block in &document.blocks {
+    for (block_index, block) in document.blocks.iter().enumerate() {
         match block {
-            Block::Heading { text, .. } | Block::Paragraph { text } => fields.push(text.as_str()),
+            Block::Heading { level, text } => fields.push(FieldRef {
+                block_index,
+                cell: None,
+                block_kind: BlockKind::Heading,
+                heading_level: Some(*level),
+                text,
+            }),
+            Block::Paragraph { text } => fields.push(FieldRef {
+                block_index,
+                cell: None,
+                block_kind: BlockKind::Paragraph,
+                heading_level: None,
+                text,
+            }),
             Block::Table { rows } => {
-                for row in rows {
-                    for cell in row {
-                        fields.push(cell.text.as_str());
+                for (row, cells) in rows.iter().enumerate() {
+                    for (col, cell) in cells.iter().enumerate() {
+                        fields.push(FieldRef {
+                            block_index,
+                            cell: Some((row, col)),
+                            block_kind: BlockKind::TableCell,
+                            heading_level: None,
+                            text: &cell.text,
+                        });
                     }
                 }
             }
@@ -391,15 +545,27 @@ fn text_fields(document: &Document) -> Vec<&str> {
 
 /// Plan the review: detect across the whole document, resolve overlaps per field, drop
 /// allow-listed values, and return one [`ReviewItem`] per distinct value in first-seen order.
+/// Each item carries every [`Occurrence`] of its value, with that occurrence's location, block
+/// kind, and own context windows.
 pub fn plan_review(document: &Document, options: &CensorOptions<'_>) -> Vec<ReviewItem> {
     let mut order: Vec<String> = Vec::new();
     let mut items: HashMap<String, ReviewItem> = HashMap::new();
-    for text in text_fields(document) {
-        let reserved = paired_spans(text);
-        for candidate in resolve_overlaps(gather_candidates(text, options), &reserved) {
-            let value = text[candidate.start..candidate.end].to_string();
+    for field in document_fields(document) {
+        let reserved = paired_spans(field.text);
+        for candidate in resolve_overlaps(gather_candidates(field.text, options), &reserved) {
+            let value = field.text[candidate.start..candidate.end].to_string();
+            let occurrence = Occurrence {
+                block_index: field.block_index,
+                cell: field.cell,
+                start: candidate.start,
+                end: candidate.end,
+                block_kind: field.block_kind,
+                heading_level: field.heading_level,
+                shown_context: sentence_window_at(field.text, candidate.start, candidate.end),
+                block_context: block_window_at(field.text, candidate.start, candidate.end),
+            };
             if let Some(item) = items.get_mut(&value) {
-                item.occurrences += 1;
+                item.occurrences.push(occurrence);
             } else {
                 order.push(value.clone());
                 items.insert(
@@ -407,9 +573,7 @@ pub fn plan_review(document: &Document, options: &CensorOptions<'_>) -> Vec<Revi
                     ReviewItem {
                         detected_type: candidate.value_type,
                         method: method_label(candidate.source, candidate.value_type),
-                        occurrences: 1,
-                        shown_context: sentence_window(text, &value),
-                        block_context: block_window(text, &value),
+                        occurrences: vec![occurrence],
                         value,
                     },
                 );
@@ -422,26 +586,100 @@ pub fn plan_review(document: &Document, options: &CensorOptions<'_>) -> Vec<Revi
         .collect()
 }
 
+/// Build a [`ReviewItem`] for an exact `value` by locating every literal occurrence across the
+/// document's text fields, with each occurrence's location, block kind, and context windows.
+///
+/// Returns `None` when `value` is empty or does not occur — so it doubles as validation for the
+/// reviewer's edited/added values (v7): a value not present cannot be censored.
+pub(crate) fn locate_value(
+    document: &Document,
+    value: &str,
+    detected_type: ValueType,
+    method: &str,
+) -> Option<ReviewItem> {
+    if value.is_empty() {
+        return None;
+    }
+    let mut occurrences = Vec::new();
+    for field in document_fields(document) {
+        for (start, matched) in field.text.match_indices(value) {
+            let end = start + matched.len();
+            occurrences.push(Occurrence {
+                block_index: field.block_index,
+                cell: field.cell,
+                start,
+                end,
+                block_kind: field.block_kind,
+                heading_level: field.heading_level,
+                shown_context: sentence_window_at(field.text, start, end),
+                block_context: block_window_at(field.text, start, end),
+            });
+        }
+    }
+    if occurrences.is_empty() {
+        return None;
+    }
+    Some(ReviewItem {
+        value: value.to_string(),
+        detected_type,
+        method: method.to_string(),
+        occurrences,
+    })
+}
+
+/// Occurrence-scoped censor spans for one document, keyed by `(block_index, cell)` — the field a
+/// span lives in. Each entry is `(start, end, label)`.
+type OccurrenceSpans<'a> = HashMap<(usize, Option<(usize, usize)>), Vec<(usize, usize, &'a str)>>;
+
 /// Apply the decisions: a copy of `document` with every **confirmed** value replaced by a
 /// `REDACTED_<FINAL_TYPE>_<NNN>` placeholder (deduped per value); rejected values are left as-is.
+///
+/// Three censor mechanisms feed each field: whole-group detector values (censored at every detector
+/// span), reviewer-supplied values (censored by literal search), and occurrence-scoped decisions
+/// from a split (censored at exactly their recorded offset). A split's *rejected* occurrence
+/// contributes no span, so it stays in the clear even though sibling occurrences of the same string
+/// are censored.
 pub fn apply(
     document: &Document,
     decisions: &[CensorDecision],
     options: &CensorOptions<'_>,
 ) -> Document {
-    let confirmed: HashMap<&str, &str> = decisions
-        .iter()
-        .filter_map(|decision| match &decision.verdict {
-            Verdict::Confirm { final_type } => Some((decision.value.as_str(), final_type.as_str())),
-            Verdict::Reject => None,
-        })
-        .collect();
+    // Whole-group, detector-found values: censor every detector span of the value.
+    let group_confirmed = confirmed_values(decisions, |decision| {
+        matches!(decision.scope, DecisionScope::Group { .. }) && !decision.is_user_supplied()
+    });
+    // Reviewer-supplied values (edited span / added value): the detector won't re-find them, so
+    // they are located by literal search instead.
+    let user_supplied = confirmed_values(decisions, CensorDecision::is_user_supplied);
+    // Occurrence-scoped confirms: censor exactly their span; a rejected occurrence adds nothing.
+    let mut occurrence_spans: OccurrenceSpans<'_> = HashMap::new();
+    for decision in decisions {
+        if let (DecisionScope::Occurrence(occurrence), Verdict::Confirm { final_type }) =
+            (&decision.scope, &decision.verdict)
+        {
+            occurrence_spans
+                .entry((occurrence.block_index, occurrence.cell))
+                .or_default()
+                .push((occurrence.start, occurrence.end, final_type.as_str()));
+        }
+    }
 
     let mut allocator = LabelAllocator::default();
     let blocks = document
         .blocks
         .iter()
-        .map(|block| apply_block(block, options, &confirmed, &mut allocator))
+        .enumerate()
+        .map(|(block_index, block)| {
+            apply_block(
+                block,
+                block_index,
+                options,
+                &group_confirmed,
+                &user_supplied,
+                &occurrence_spans,
+                &mut allocator,
+            )
+        })
         .collect();
     Document {
         source: document.source.clone(),
@@ -449,28 +687,76 @@ pub fn apply(
     }
 }
 
+/// The `value → final_type` map of confirmed decisions matching `select`.
+fn confirmed_values(
+    decisions: &[CensorDecision],
+    select: impl Fn(&CensorDecision) -> bool,
+) -> HashMap<&str, &str> {
+    decisions
+        .iter()
+        .filter(|decision| select(decision))
+        .filter_map(|decision| match &decision.verdict {
+            Verdict::Confirm { final_type } => Some((decision.value.as_str(), final_type.as_str())),
+            Verdict::Reject => None,
+        })
+        .collect()
+}
+
 /// Apply confirmed censorings to every text field of a block.
 fn apply_block(
     block: &Block,
+    block_index: usize,
     options: &CensorOptions<'_>,
-    confirmed: &HashMap<&str, &str>,
+    group_confirmed: &HashMap<&str, &str>,
+    user_supplied: &HashMap<&str, &str>,
+    occurrence_spans: &OccurrenceSpans<'_>,
     allocator: &mut LabelAllocator,
 ) -> Block {
+    let empty: &[(usize, usize, &str)] = &[];
+    let field_spans = |cell: Option<(usize, usize)>| {
+        occurrence_spans
+            .get(&(block_index, cell))
+            .map_or(empty, Vec::as_slice)
+    };
     match block {
         Block::Heading { level, text } => Block::Heading {
             level: *level,
-            text: apply_text(text, options, confirmed, allocator),
+            text: apply_text(
+                text,
+                options,
+                group_confirmed,
+                user_supplied,
+                field_spans(None),
+                allocator,
+            ),
         },
         Block::Paragraph { text } => Block::Paragraph {
-            text: apply_text(text, options, confirmed, allocator),
+            text: apply_text(
+                text,
+                options,
+                group_confirmed,
+                user_supplied,
+                field_spans(None),
+                allocator,
+            ),
         },
         Block::Table { rows } => Block::Table {
             rows: rows
                 .iter()
-                .map(|row| {
-                    row.iter()
-                        .map(|cell| Cell {
-                            text: apply_text(&cell.text, options, confirmed, allocator),
+                .enumerate()
+                .map(|(row, cells)| {
+                    cells
+                        .iter()
+                        .enumerate()
+                        .map(|(col, cell)| Cell {
+                            text: apply_text(
+                                &cell.text,
+                                options,
+                                group_confirmed,
+                                user_supplied,
+                                field_spans(Some((row, col))),
+                                allocator,
+                            ),
                         })
                         .collect()
                 })
@@ -479,24 +765,82 @@ fn apply_block(
     }
 }
 
-/// Substitute only the confirmed values in one text field (right-to-left to keep offsets valid).
+/// Substitute the confirmed values in one text field (right-to-left to keep offsets valid).
+///
+/// Spans come from three sources — detector candidates whose value is a confirmed whole-group
+/// value, occurrence-scoped offsets recorded for this field, and literal occurrences of
+/// reviewer-supplied values — each carrying its placeholder label. Reserved bracket spans and
+/// overlaps are dropped, so every byte is replaced at most once.
 fn apply_text(
     text: &str,
     options: &CensorOptions<'_>,
-    confirmed: &HashMap<&str, &str>,
+    group_confirmed: &HashMap<&str, &str>,
+    user_supplied: &HashMap<&str, &str>,
+    occurrence_spans: &[(usize, usize, &str)],
     allocator: &mut LabelAllocator,
 ) -> String {
     let reserved = paired_spans(text);
-    let claimed = resolve_overlaps(gather_candidates(text, options), &reserved);
-    let mut result = text.to_string();
-    for span in claimed.iter().rev() {
-        let value = &text[span.start..span.end];
-        if let Some(&label) = confirmed.get(value) {
-            let placeholder = allocator.placeholder_for(value, label);
-            result.replace_range(span.start..span.end, &placeholder);
+    let mut spans: Vec<(usize, usize, &str)> = Vec::new();
+
+    // 1. Detector candidate spans whose value is a confirmed whole-group value.
+    for candidate in resolve_overlaps(gather_candidates(text, options), &reserved) {
+        if let Some(&label) = group_confirmed.get(&text[candidate.start..candidate.end]) {
+            spans.push((candidate.start, candidate.end, label));
         }
     }
+
+    // 2. Occurrence-scoped offsets for this field (already non-reserved, valid byte spans).
+    spans.extend_from_slice(occurrence_spans);
+
+    // 3. Literal occurrences of reviewer-supplied values, longest first for determinism,
+    //    skipping reserved spans and anything already claimed.
+    let mut user_values: Vec<(&str, &str)> = user_supplied.iter().map(|(&v, &l)| (v, l)).collect();
+    user_values.sort_unstable_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(b.0)));
+    for (value, label) in user_values {
+        for (start, end) in literal_spans(text, value) {
+            if !intersects(&reserved, start, end) && !overlaps(&spans, start, end) {
+                spans.push((start, end, label));
+            }
+        }
+    }
+
+    // Keep a non-overlapping set (greedy by start), then replace right-to-left.
+    spans.sort_by_key(|&(start, _, _)| start);
+    let mut last_end = 0;
+    let mut kept: Vec<(usize, usize, &str)> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if span.0 >= last_end {
+            last_end = span.1;
+            kept.push(span);
+        }
+    }
+
+    let mut result = text.to_string();
+    for &(start, end, label) in kept.iter().rev() {
+        let placeholder = allocator.placeholder_for(&text[start..end], label);
+        result.replace_range(start..end, &placeholder);
+    }
     result
+}
+
+/// Non-overlapping byte spans of every literal occurrence of `value` in `text`.
+fn literal_spans(text: &str, value: &str) -> Vec<(usize, usize)> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    text.match_indices(value)
+        .map(|(start, matched)| (start, start + matched.len()))
+        .collect()
+}
+
+/// Whether `[start, end)` intersects any `[s, e)` span in `spans`.
+fn intersects(spans: &[(usize, usize)], start: usize, end: usize) -> bool {
+    spans.iter().any(|&(s, e)| start < e && s < end)
+}
+
+/// Whether `[start, end)` overlaps any labeled span in `spans`.
+fn overlaps(spans: &[(usize, usize, &str)], start: usize, end: usize) -> bool {
+    spans.iter().any(|&(s, e, _)| start < e && s < end)
 }
 
 /// Allocates `REDACTED_<LABEL>_<NNN>` placeholders, deduping by exact value and counting per
@@ -521,19 +865,17 @@ impl LabelAllocator {
     }
 }
 
-/// Build the schema-3 decision-log records for the human-reviewed decisions (auto-defaulted
-/// items are skipped). `items` and `decisions` are parallel (one decision per item).
+/// Build the decision-log records for the human-reviewed decisions (auto-defaulted items are
+/// skipped). Each [`CensorDecision`] is self-contained, so no parallel `items` slice is needed.
 pub fn decision_records(
-    items: &[ReviewItem],
     decisions: &[CensorDecision],
     source: &str,
     timestamp: u64,
 ) -> Vec<DecisionRecord> {
-    items
+    decisions
         .iter()
-        .zip(decisions)
-        .filter(|(_, decision)| decision.reviewed)
-        .map(|(item, decision)| {
+        .filter(|decision| decision.reviewed)
+        .map(|decision| {
             let (verdict, final_type) = match &decision.verdict {
                 Verdict::Confirm { final_type } => ("confirm", Some(final_type.clone())),
                 Verdict::Reject => ("reject", None),
@@ -542,14 +884,14 @@ pub fn decision_records(
                 schema: decision_schema(),
                 timestamp,
                 source: source.to_string(),
-                value: item.value.clone(),
-                method: item.method.clone(),
-                detected_type: item.detected_type.label().to_string(),
+                value: decision.value.clone(),
+                method: decision.method.clone(),
+                detected_type: decision.detected_type.label().to_string(),
                 verdict: verdict.to_string(),
                 final_type,
-                shown_context: item.shown_context.clone(),
-                block_context: item.block_context.clone(),
-                occurrences: item.occurrences as u32,
+                shown_context: decision.shown_context.clone(),
+                block_context: decision.block_context.clone(),
+                occurrences: decision.occurrences(),
             }
         })
         .collect()
@@ -558,13 +900,13 @@ pub fn decision_records(
 /// Fold the human-reviewed decisions into the learned store: a `reject` (false positive) marks
 /// the value safe to leave in the clear (`allow`); a `confirm` keeps it censored (`deny`). A
 /// value seen both ways becomes conflicted and stays censored.
-pub fn update_store(store: &mut LearnedStore, items: &[ReviewItem], decisions: &[CensorDecision]) {
-    for (item, decision) in items.iter().zip(decisions) {
+pub fn update_store(store: &mut LearnedStore, decisions: &[CensorDecision]) {
+    for decision in decisions {
         if !decision.reviewed {
             continue;
         }
         let allow = matches!(decision.verdict, Verdict::Reject);
-        store.record(&item.value, item.detected_type.label(), allow);
+        store.record(&decision.value, decision.detected_type.label(), allow);
     }
 }
 
@@ -853,30 +1195,45 @@ mod tests {
             value: value.into(),
             detected_type: ty,
             method: "regex:test".into(),
-            occurrences: 1,
-            shown_context: format!("ctx {value}"),
-            block_context: format!("blk {value}"),
+            occurrences: vec![Occurrence {
+                block_index: 0,
+                cell: None,
+                start: 0,
+                end: value.len(),
+                block_kind: BlockKind::Paragraph,
+                heading_level: None,
+                shown_context: format!("ctx {value}"),
+                block_context: format!("blk {value}"),
+            }],
         }
     }
 
     fn confirm_dec(value: &str, ty: ValueType, label: &str) -> CensorDecision {
-        CensorDecision {
-            value: value.into(),
-            detected_type: ty,
-            verdict: Verdict::Confirm {
+        CensorDecision::from_item(
+            &item(value, ty),
+            Verdict::Confirm {
                 final_type: label.into(),
             },
-            reviewed: true,
-        }
+            true,
+        )
     }
 
     fn reject_dec(value: &str, ty: ValueType) -> CensorDecision {
-        CensorDecision {
-            value: value.into(),
-            detected_type: ty,
-            verdict: Verdict::Reject,
-            reviewed: true,
-        }
+        CensorDecision::from_item(&item(value, ty), Verdict::Reject, true)
+    }
+
+    /// A confirmed decision for a reviewer-supplied (edited/added) value, censored by literal
+    /// search rather than the detector.
+    fn user_value_dec(value: &str, label: &str) -> CensorDecision {
+        let mut decision = CensorDecision::from_item(
+            &item(value, ValueType::Entity),
+            Verdict::Confirm {
+                final_type: label.into(),
+            },
+            true,
+        );
+        decision.user_added = true;
+        decision
     }
 
     fn para_text(doc: &Document) -> &str {
@@ -893,11 +1250,57 @@ mod tests {
         assert_eq!(items.len(), 1, "the value is deduped to one review item");
         assert_eq!(items[0].value, "a@b.com");
         assert_eq!(items[0].detected_type, ValueType::Email);
-        assert_eq!(items[0].occurrences, 2);
+        assert_eq!(items[0].occurrence_count(), 2, "both occurrences captured");
         assert_eq!(items[0].method, "regex:email");
         assert!(
-            items[0].shown_context.contains("a@b.com"),
+            items[0].first_shown_context().contains("a@b.com"),
             "context captured"
+        );
+    }
+
+    #[test]
+    fn plan_review_records_per_occurrence_location_and_kind() {
+        // The same value in a heading and a table cell: one item, two located occurrences.
+        let doc = Document {
+            source: PathBuf::from("c.docx"),
+            blocks: vec![
+                Block::Heading {
+                    level: 2,
+                    text: "Email a@b.com".into(),
+                },
+                Block::Paragraph {
+                    text: "filler".into(),
+                },
+                Block::Table {
+                    rows: vec![vec![Cell::new("write to a@b.com please")]],
+                },
+            ],
+        };
+        let items = plan_review(&doc, &CensorOptions::default());
+        assert_eq!(items.len(), 1);
+        let occs = &items[0].occurrences;
+        assert_eq!(occs.len(), 2);
+
+        // First occurrence: inside the heading (block 0), kind + level recorded.
+        assert_eq!(occs[0].block_index, 0);
+        assert_eq!(occs[0].block_kind, BlockKind::Heading);
+        assert_eq!(occs[0].heading_level, Some(2));
+        assert_eq!(occs[0].cell, None);
+        assert_eq!(&"Email a@b.com"[occs[0].start..occs[0].end], "a@b.com");
+
+        // Second occurrence: inside the table cell (block 2), located by (row, col).
+        assert_eq!(occs[1].block_index, 2);
+        assert_eq!(occs[1].block_kind, BlockKind::TableCell);
+        assert_eq!(occs[1].cell, Some((0, 0)));
+
+        // The two occurrences carry their own context windows.
+        assert!(occs[0].shown_context.contains("Email"));
+        assert!(occs[1].shown_context.contains("please"));
+        assert_eq!(
+            items[0].block_kinds(),
+            [BlockKind::Heading, BlockKind::TableCell]
+                .into_iter()
+                .collect()
         );
     }
 
@@ -951,38 +1354,182 @@ mod tests {
     fn apply_keeps_unreviewed_defaults_censored() {
         // An item auto-confirmed on quit (reviewed: false) is still censored for safety.
         let doc = paragraph_doc("Email a@b.com now");
-        let decisions = vec![CensorDecision {
-            value: "a@b.com".into(),
-            detected_type: ValueType::Email,
-            verdict: Verdict::Confirm {
+        let decisions = vec![CensorDecision::from_item(
+            &item("a@b.com", ValueType::Email),
+            Verdict::Confirm {
                 final_type: "EMAIL".into(),
             },
-            reviewed: false,
-        }];
+            false,
+        )];
         let out = apply(&doc, &decisions, &CensorOptions::default());
         assert!(para_text(&out).contains("REDACTED_EMAIL_001"));
     }
 
     #[test]
-    fn decision_records_skip_unreviewed_and_map_schema_3_fields() {
-        let items = vec![
-            item("a@b.com", ValueType::Email),
-            item("Jane", ValueType::Entity),
-            item("X", ValueType::Person),
+    fn apply_censors_a_user_supplied_value_by_literal_search() {
+        // "Jane Doe" is not a detector candidate (no party list, no name heuristic yet), so it
+        // is censored only because the reviewer supplied it — every occurrence, shared placeholder.
+        let doc = paragraph_doc("pay Jane Doe and Jane Doe again");
+        let decisions = vec![user_value_dec("Jane Doe", "PERSON")];
+        let out = apply(&doc, &decisions, &CensorOptions::default());
+        let text = para_text(&out);
+        assert!(!text.contains("Jane Doe"), "user value censored: {text}");
+        assert_eq!(
+            text.matches("REDACTED_PERSON_001").count(),
+            2,
+            "both occurrences share one placeholder: {text}"
+        );
+    }
+
+    #[test]
+    fn decision_scope_distinguishes_group_and_occurrence() {
+        // from_item → whole-group scope (the test item() helper has one occurrence).
+        let group = confirm_dec("Acme", ValueType::Org, "ORG");
+        assert!(matches!(group.scope, DecisionScope::Group { .. }));
+        assert_eq!(group.occurrences(), 1);
+
+        // from_occurrence → occurrence scope carrying the precise location + that occurrence's context.
+        let occurrence = Occurrence {
+            block_index: 4,
+            cell: None,
+            start: 2,
+            end: 6,
+            block_kind: BlockKind::Paragraph,
+            heading_level: None,
+            shown_context: "rate of 3% applies".into(),
+            block_context: "the full clause".into(),
+        };
+        let decision = CensorDecision::from_occurrence(
+            "3%",
+            ValueType::Percent,
+            "regex:percent",
+            occurrence,
+            Verdict::Reject,
+        );
+        assert!(matches!(decision.scope, DecisionScope::Occurrence(_)));
+        assert_eq!(decision.occurrences(), 1);
+        assert_eq!(decision.shown_context, "rate of 3% applies");
+        assert!(matches!(decision.verdict, Verdict::Reject));
+    }
+
+    fn occ_at(cell: Option<(usize, usize)>, start: usize, end: usize) -> Occurrence {
+        Occurrence {
+            block_index: 0,
+            cell,
+            start,
+            end,
+            block_kind: if cell.is_some() {
+                BlockKind::TableCell
+            } else {
+                BlockKind::Paragraph
+            },
+            heading_level: None,
+            shown_context: String::new(),
+            block_context: String::new(),
+        }
+    }
+
+    fn occ_dec(value: &str, occurrence: Occurrence, verdict: Verdict) -> CensorDecision {
+        CensorDecision::from_occurrence(
+            value,
+            ValueType::Percent,
+            "regex:percent",
+            occurrence,
+            verdict,
+        )
+    }
+
+    #[test]
+    fn apply_offset_path_censors_only_confirmed_split_occurrences() {
+        // Three "3%" in one paragraph (offsets 0, 8, 16); confirm the outer two, reject the middle.
+        let doc = paragraph_doc("3% then 3% then 3%");
+        let confirm = || Verdict::Confirm {
+            final_type: "PERCENT".into(),
+        };
+        let decisions = vec![
+            occ_dec("3%", occ_at(None, 0, 2), confirm()),
+            occ_dec("3%", occ_at(None, 8, 10), Verdict::Reject),
+            occ_dec("3%", occ_at(None, 16, 18), confirm()),
         ];
+        let out = apply(&doc, &decisions, &CensorOptions::default());
+        // Confirmed occurrences share one placeholder; the rejected middle stays literal — even
+        // though the detector would otherwise flag every "3%".
+        assert_eq!(
+            para_text(&out),
+            "REDACTED_PERCENT_001 then 3% then REDACTED_PERCENT_001"
+        );
+    }
+
+    #[test]
+    fn apply_offset_path_targets_the_right_table_cell() {
+        let doc = Document {
+            source: PathBuf::from("c.docx"),
+            blocks: vec![Block::Table {
+                rows: vec![vec![Cell::new("Acme"), Cell::new("Acme")]],
+            }],
+        };
+        // Censor only the second cell's "Acme" (row 0, col 1).
+        let decisions = vec![CensorDecision::from_occurrence(
+            "Acme",
+            ValueType::Org,
+            "manual",
+            occ_at(Some((0, 1)), 0, 4),
+            Verdict::Confirm {
+                final_type: "ORG".into(),
+            },
+        )];
+        let out = apply(&doc, &decisions, &CensorOptions::default());
+        let Block::Table { rows } = &out.blocks[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(rows[0][0].text, "Acme", "first cell untouched");
+        assert!(
+            rows[0][1].text.contains("REDACTED_ORG_001"),
+            "second cell censored: {}",
+            rows[0][1].text
+        );
+    }
+
+    #[test]
+    fn locate_value_finds_every_occurrence_or_none() {
+        let doc = Document {
+            source: PathBuf::from("c.docx"),
+            blocks: vec![
+                Block::Heading {
+                    level: 1,
+                    text: "Acme intro".into(),
+                },
+                Block::Paragraph {
+                    text: "Acme and Acme".into(),
+                },
+            ],
+        };
+        let item = locate_value(&doc, "Acme", ValueType::Org, "manual").expect("Acme is present");
+        assert_eq!(
+            item.occurrence_count(),
+            3,
+            "1 in the heading + 2 in the paragraph"
+        );
+        assert_eq!(item.detected_type, ValueType::Org);
+        assert_eq!(item.method, "manual");
+        assert!(locate_value(&doc, "Nope", ValueType::Org, "manual").is_none());
+        assert!(locate_value(&doc, "", ValueType::Org, "manual").is_none());
+    }
+
+    #[test]
+    fn decision_records_skip_unreviewed_and_map_schema_3_fields() {
         let decisions = vec![
             confirm_dec("a@b.com", ValueType::Email, "EMAIL"),
             reject_dec("Jane", ValueType::Entity),
-            CensorDecision {
-                value: "X".into(),
-                detected_type: ValueType::Person,
-                verdict: Verdict::Confirm {
+            CensorDecision::from_item(
+                &item("X", ValueType::Person),
+                Verdict::Confirm {
                     final_type: "PERSON".into(),
                 },
-                reviewed: false,
-            },
+                false,
+            ),
         ];
-        let records = decision_records(&items, &decisions, "c.txt", 7);
+        let records = decision_records(&decisions, "c.txt", 7);
         assert_eq!(records.len(), 2, "the unreviewed item is not logged");
         assert_eq!(records[0].schema, decision_schema());
         assert_eq!(records[0].verdict, "confirm");
@@ -998,29 +1545,15 @@ mod tests {
     fn update_store_allows_rejects_denies_confirms_and_conflicts() {
         let mut store = LearnedStore::default();
         // reject → the value is safe to leave in the clear next run.
-        update_store(
-            &mut store,
-            &[item("Reach", ValueType::Entity)],
-            &[reject_dec("Reach", ValueType::Entity)],
-        );
+        update_store(&mut store, &[reject_dec("Reach", ValueType::Entity)]);
         assert!(store.allowed_values().contains("Reach"));
         // confirm → kept censored (never allow-listed).
-        update_store(
-            &mut store,
-            &[item("Acme", ValueType::Org)],
-            &[confirm_dec("Acme", ValueType::Org, "ORG")],
-        );
+        update_store(&mut store, &[confirm_dec("Acme", ValueType::Org, "ORG")]);
         assert!(!store.allowed_values().contains("Acme"));
         // seen both ways across runs → conflicted → stays censored.
-        let maybe = [item("Maybe", ValueType::Entity)];
+        update_store(&mut store, &[reject_dec("Maybe", ValueType::Entity)]);
         update_store(
             &mut store,
-            &maybe,
-            &[reject_dec("Maybe", ValueType::Entity)],
-        );
-        update_store(
-            &mut store,
-            &maybe,
             &[confirm_dec("Maybe", ValueType::Entity, "ENTITY")],
         );
         assert!(!store.allowed_values().contains("Maybe"));

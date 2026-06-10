@@ -94,7 +94,7 @@ pub enum Block {
 /// `heading` and `list_item` reflect the paragraph's semantic role; `table_cell` is a
 /// plain paragraph inside a table cell (a heading or list item inside a table keeps its
 /// role and is flagged by [`StyledBlock::in_table`] instead).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockKind {
     /// A body paragraph.
@@ -123,6 +123,49 @@ impl BlockKind {
             BlockKind::TableCell => "table_cell",
         }
     }
+}
+
+/// One location of a detected value within a document, with the review context captured at
+/// that spot.
+///
+/// A [`crate::censor::ReviewItem`] groups all occurrences of one value; splitting a group in
+/// review (v7) decides each `Occurrence` on its own. The byte offsets index into the text of
+/// the field located by [`block_index`](Occurrence::block_index) and [`cell`](Occurrence::cell).
+///
+/// ```
+/// use stencil::model::{BlockKind, Occurrence};
+///
+/// let occ = Occurrence {
+///     block_index: 2,
+///     cell: None,
+///     start: 4,
+///     end: 22,
+///     block_kind: BlockKind::Paragraph,
+///     heading_level: None,
+///     shown_context: "Pay REDACTED_MONEY_001 now.".into(),
+///     block_context: "The buyer shall pay REDACTED_MONEY_001 now.".into(),
+/// };
+/// assert_eq!(&occ.shown_context[occ.start..occ.end], "REDACTED_MONEY_001");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Occurrence {
+    /// Index of the containing [`Block`] in [`Document::blocks`].
+    pub block_index: usize,
+    /// For a [`BlockKind::TableCell`], the `(row, column)` of the cell; `None` otherwise.
+    pub cell: Option<(usize, usize)>,
+    /// Byte offset of the value's start within the located field's text.
+    pub start: usize,
+    /// Byte offset of the value's end (exclusive) within the located field's text.
+    pub end: usize,
+    /// The structural role of the containing block. Censor detection never emits
+    /// [`BlockKind::ListItem`] — list items fold into [`BlockKind::Paragraph`] in v7.
+    pub block_kind: BlockKind,
+    /// Outline level when [`block_kind`](Occurrence::block_kind) is [`BlockKind::Heading`].
+    pub heading_level: Option<u8>,
+    /// The sentence-ish window shown to the reviewer / recorded as `shown_context`.
+    pub shown_context: String,
+    /// The whole-paragraph window recorded as the richer `block_context` feature.
+    pub block_context: String,
 }
 
 /// Paragraph indentation, in twips (1/1440 inch); `None` where the property is unset.

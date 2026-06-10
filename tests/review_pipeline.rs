@@ -52,17 +52,15 @@ fn censor_pipeline_logs_schema_3_and_censors_only_confirmed() {
     // Synthetic reviewer: confirm the email, reject everything else (e.g. the money).
     let decisions: Vec<CensorDecision> = items
         .iter()
-        .map(|item| CensorDecision {
-            value: item.value.clone(),
-            detected_type: item.detected_type,
-            verdict: if item.value.contains('@') {
+        .map(|item| {
+            let verdict = if item.value.contains('@') {
                 Verdict::Confirm {
                     final_type: "EMAIL".to_string(),
                 }
             } else {
                 Verdict::Reject
-            },
-            reviewed: true,
+            };
+            CensorDecision::from_item(item, verdict, true)
         })
         .collect();
 
@@ -87,7 +85,7 @@ fn censor_pipeline_logs_schema_3_and_censors_only_confirmed() {
 
     // The schema-3 decision log: one confirm row (final_type set) and one reject row (null).
     let log_path = unique("censor_log").join("decisions.jsonl");
-    let records = censor::decision_records(&items, &decisions, "c.docx", 42);
+    let records = censor::decision_records(&decisions, "c.docx", 42);
     for record in &records {
         learn::append_decision(&log_path, record).expect("append decision");
     }

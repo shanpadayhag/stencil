@@ -197,25 +197,38 @@ fn run_censor_stage(
         allow: Some(learned_allowed),
     };
     let items = censor::plan_review(extracted, &options);
-    let decisions = run_censor_review(&items)?;
+    let decisions = run_censor_review(extracted, &items)?;
     let working = censor::apply(extracted, &decisions, &options);
 
+    // A value is "rejected" downstream (left in the clear in the snippet/styling stages) only when
+    // *no* occurrence of it was confirmed. A split with mixed verdicts keeps the value censored
+    // everywhere downstream, so a confirmed occurrence never leaks into an always-censored snippet.
+    let confirmed_values: BTreeSet<String> = decisions
+        .iter()
+        .filter(|decision| matches!(decision.verdict, Verdict::Confirm { .. }))
+        .map(|decision| decision.value.clone())
+        .collect();
     let rejected: BTreeSet<String> = decisions
         .iter()
-        .filter_map(|decision| match &decision.verdict {
-            Verdict::Reject => Some(decision.value.clone()),
-            Verdict::Confirm { .. } => None,
-        })
+        .filter(|decision| matches!(decision.verdict, Verdict::Reject))
+        .map(|decision| decision.value.clone())
+        .filter(|value| !confirmed_values.contains(value))
         .collect();
-    let kept = decisions.len() - rejected.len();
+    let kept = decisions
+        .iter()
+        .filter(|decision| matches!(decision.verdict, Verdict::Confirm { .. }))
+        .count();
+    let rejected_count = decisions.len() - kept;
     println!(
-        "Censor: reviewed {} value(s) — {kept} kept, {} rejected.",
-        items.len(),
-        rejected.len()
+        "Censor: {} value(s) decided — {kept} kept, {rejected_count} rejected.",
+        decisions
+            .iter()
+            .filter(|decision| decision.reviewed)
+            .count(),
     );
 
     let source = extracted.source.display().to_string();
-    persist_decisions(args, &items, &decisions, &source);
+    persist_decisions(args, &decisions, &source);
     Ok((working, rejected))
 }
 
@@ -231,16 +244,11 @@ fn load_allowed(args: &ReviewArgs) -> BTreeSet<String> {
 ///
 /// Best-effort: a storage hiccup must never fail the review the user just completed, so problems
 /// are reported, not propagated. Only human-reviewed decisions are persisted.
-fn persist_decisions(
-    args: &ReviewArgs,
-    items: &[censor::ReviewItem],
-    decisions: &[CensorDecision],
-    source: &str,
-) {
+fn persist_decisions(args: &ReviewArgs, decisions: &[CensorDecision], source: &str) {
     if !decisions.iter().any(|decision| decision.reviewed) {
         return;
     }
-    let records = censor::decision_records(items, decisions, source, learn::now_epoch_secs());
+    let records = censor::decision_records(decisions, source, learn::now_epoch_secs());
     let (Ok(store_path), Ok(log_path)) = (
         learn::store_path(args.data_dir.as_deref(), args.censor_dir.as_deref()),
         learn::log_path(args.data_dir.as_deref(), args.censor_dir.as_deref()),
@@ -255,7 +263,7 @@ fn persist_decisions(
         }
     }
     let mut store = LearnedStore::load(&store_path).unwrap_or_default();
-    censor::update_store(&mut store, items, decisions);
+    censor::update_store(&mut store, decisions);
     if let Err(err) = store.save(&store_path) {
         eprintln!("note: could not save the learned store: {err}");
     }

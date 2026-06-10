@@ -432,55 +432,68 @@ pub fn now_epoch_secs() -> u64 {
 /// side, bounded by [`SENTENCE_MAX_RADIUS`] chars per side. Empty if `needle` is absent.
 ///
 /// This is what the interactive prompt shows the user and what `shown_context` records.
+/// For a specific occurrence (not the first), use [`sentence_window_at`] with its byte span.
 pub fn sentence_window(text: &str, needle: &str) -> String {
-    let Some(pos) = text.find(needle) else {
-        return String::new();
-    };
-    let after = pos + needle.len();
+    match text.find(needle) {
+        Some(pos) => sentence_window_at(text, pos, pos + needle.len()),
+        None => String::new(),
+    }
+}
 
+/// [`sentence_window`] anchored at an explicit byte span `start..end` rather than the first
+/// match of a needle, so each occurrence of a repeated value gets its own window.
+///
+/// `start..end` must be a valid char-boundary span within `text` (the byte offsets of a
+/// detected candidate satisfy this).
+pub fn sentence_window_at(text: &str, start: usize, end: usize) -> String {
     // Left: from the radius floor, take everything after the last terminator (if any).
-    let left_floor = floor_boundary(text, pos.saturating_sub(SENTENCE_MAX_RADIUS));
-    let start = match text[left_floor..pos].rfind(is_terminator) {
+    let left_floor = floor_boundary(text, start.saturating_sub(SENTENCE_MAX_RADIUS));
+    let win_start = match text[left_floor..start].rfind(is_terminator) {
         // Terminators are ASCII, so +1 lands on a char boundary just past them.
         Some(offset) => left_floor + offset + 1,
         None => left_floor,
     };
 
-    // Right: from the end of the needle, include up to and including the next terminator.
-    let right_ceil = ceil_boundary(text, (after + SENTENCE_MAX_RADIUS).min(text.len()));
-    let end = match text[after..right_ceil].find(is_terminator) {
-        Some(offset) => after + offset + 1,
+    // Right: from the end of the span, include up to and including the next terminator.
+    let right_ceil = ceil_boundary(text, (end + SENTENCE_MAX_RADIUS).min(text.len()));
+    let win_end = match text[end..right_ceil].find(is_terminator) {
+        Some(offset) => end + offset + 1,
         None => right_ceil,
     };
 
-    collapse_ws(&text[start..end])
+    collapse_ws(&text[win_start..win_end])
 }
 
 /// The whole blank-line-delimited paragraph (`block`) containing the first occurrence of
 /// `needle`, whitespace-collapsed and bounded by [`BLOCK_MAX_RADIUS`] chars per side as a
 /// safety net for inputs with no blank lines. Empty if `needle` is absent.
 ///
-/// This is the richer `block_context` feature stored for future ML.
+/// This is the richer `block_context` feature stored for future ML. For a specific occurrence,
+/// use [`block_window_at`] with its byte span.
 pub fn block_window(text: &str, needle: &str) -> String {
-    let Some(pos) = text.find(needle) else {
-        return String::new();
-    };
-    let after = pos + needle.len();
+    match text.find(needle) {
+        Some(pos) => block_window_at(text, pos, pos + needle.len()),
+        None => String::new(),
+    }
+}
 
-    let left_floor = floor_boundary(text, pos.saturating_sub(BLOCK_MAX_RADIUS));
+/// [`block_window`] anchored at an explicit byte span `start..end` rather than the first match
+/// of a needle. `start..end` must be a valid char-boundary span within `text`.
+pub fn block_window_at(text: &str, start: usize, end: usize) -> String {
+    let left_floor = floor_boundary(text, start.saturating_sub(BLOCK_MAX_RADIUS));
     // A blank line ("\n\n") separates paragraphs; start just past the last one before us.
-    let start = match text[left_floor..pos].rfind("\n\n") {
+    let win_start = match text[left_floor..start].rfind("\n\n") {
         Some(offset) => left_floor + offset + 2,
         None => left_floor,
     };
 
-    let right_ceil = ceil_boundary(text, (after + BLOCK_MAX_RADIUS).min(text.len()));
-    let end = match text[after..right_ceil].find("\n\n") {
-        Some(offset) => after + offset,
+    let right_ceil = ceil_boundary(text, (end + BLOCK_MAX_RADIUS).min(text.len()));
+    let win_end = match text[end..right_ceil].find("\n\n") {
+        Some(offset) => end + offset,
         None => right_ceil,
     };
 
-    collapse_ws(&text[start..end])
+    collapse_ws(&text[win_start..win_end])
 }
 
 /// True for the sentence terminators the window grows toward.
