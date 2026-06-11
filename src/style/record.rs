@@ -14,13 +14,13 @@ use anyhow::{Context, Result};
 use crate::learn::{
     self, Indent, NeighborContext, Numbering, ParaStyle, RelativeStyle, RunStyle, StylingRecord,
 };
-use crate::model::{DocumentStyleProfile, RelativeFeatures, StyledBlock};
+use crate::model::{BlockKind, DocumentStyleProfile, RelativeFeatures, StyledBlock};
 use crate::style::review::{StyleDecision, StyleVerdict};
 
 /// Build the persisted [`StylingRecord`] for one reviewed block.
 ///
 /// `relative` is the block's [`RelativeFeatures`] against the document profile; `context` is the
-/// neighboring blocks' text (see [`neighbor_context`]); `source` is the document path.
+/// neighboring blocks' text and structure (see [`neighbor_context`]); `source` is the document path.
 pub fn build_record(
     block: &StyledBlock,
     relative: &RelativeFeatures,
@@ -59,12 +59,42 @@ pub fn build_record(
     }
 }
 
-/// The text of the blocks immediately before and after `index`; empty at the ends.
+/// The text and structure of the blocks immediately before and after `index`, in document order.
+///
+/// `*_text` is empty and `*_kind`/`*_numbering` are `None` at a document edge (no neighbor on that
+/// side). The numbering is captured only when the neighbor is a list item — the raw facts behind
+/// [`crate::style::profile::positional_notes`], so a future anomaly definition stays re-derivable.
 pub fn neighbor_context(blocks: &[StyledBlock], index: usize) -> NeighborContext {
-    let text_at = |position: usize| blocks.get(position).map(|b| b.text.trim().to_string());
+    let prev = index
+        .checked_sub(1)
+        .and_then(|position| blocks.get(position));
+    let next = blocks.get(index + 1);
     NeighborContext {
-        prev_text: index.checked_sub(1).and_then(text_at).unwrap_or_default(),
-        next_text: text_at(index + 1).unwrap_or_default(),
+        prev_text: neighbor_text(prev),
+        next_text: neighbor_text(next),
+        prev_kind: prev.map(|block| block.block_kind.as_str().to_string()),
+        next_kind: next.map(|block| block.block_kind.as_str().to_string()),
+        prev_numbering: prev.and_then(neighbor_numbering),
+        next_numbering: next.and_then(neighbor_numbering),
+    }
+}
+
+/// The trimmed text of a neighbor, or empty when there is no neighbor on that side.
+fn neighbor_text(block: Option<&StyledBlock>) -> String {
+    block
+        .map(|block| block.text.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// A neighbor's numbering when it is a list item; `None` otherwise. Mirrors the `positional_notes`
+/// rule that a numbered heading is a heading, not a list item.
+fn neighbor_numbering(block: &StyledBlock) -> Option<Numbering> {
+    match block.block_kind {
+        BlockKind::ListItem => Some(Numbering {
+            num_id: block.para.numbering.num_id,
+            ilvl: block.para.numbering.ilvl,
+        }),
+        _ => None,
     }
 }
 
@@ -337,13 +367,58 @@ mod tests {
         let middle = neighbor_context(&blocks, 1);
         assert_eq!(middle.prev_text, "first");
         assert_eq!(middle.next_text, "third");
+        assert_eq!(middle.prev_kind.as_deref(), Some("paragraph"));
+        assert_eq!(middle.next_kind.as_deref(), Some("paragraph"));
 
         let first = neighbor_context(&blocks, 0);
         assert_eq!(first.prev_text, "");
         assert_eq!(first.next_text, "second");
+        assert_eq!(first.prev_kind, None, "no neighbor before the first block");
 
         let last = neighbor_context(&blocks, 2);
         assert_eq!(last.next_text, "");
+        assert_eq!(last.next_kind, None, "no neighbor after the last block");
+    }
+
+    #[test]
+    fn neighbor_context_captures_kind_and_list_numbering() {
+        let mut item = block(
+            0,
+            "first item",
+            ModelParaStyle {
+                numbering: ModelNumbering {
+                    num_id: Some(4),
+                    ilvl: Some(1),
+                },
+                ..ModelParaStyle::default()
+            },
+            ModelRunStyle::default(),
+        );
+        item.block_kind = BlockKind::ListItem;
+        let para = block(
+            1,
+            "body",
+            ModelParaStyle::default(),
+            ModelRunStyle::default(),
+        );
+        let blocks = [item, para];
+
+        // The list-item neighbor contributes its kind *and* numbering.
+        let context = neighbor_context(&blocks, 1);
+        assert_eq!(context.prev_kind.as_deref(), Some("list_item"));
+        assert_eq!(
+            context.prev_numbering,
+            Some(Numbering {
+                num_id: Some(4),
+                ilvl: Some(1)
+            })
+        );
+        assert_eq!(context.next_kind, None);
+
+        // A non-list neighbor carries its kind but no numbering.
+        let context0 = neighbor_context(&blocks, 0);
+        assert_eq!(context0.next_kind.as_deref(), Some("paragraph"));
+        assert_eq!(context0.next_numbering, None);
     }
 
     #[test]

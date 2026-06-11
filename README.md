@@ -72,8 +72,12 @@ stencil review contract.docx --skip snippet    # censor only
 
 Walks every block (paragraphs, headings, list items, table cells) showing its formatting against the
 document's norms; you mark each **[space]** fine or **[w]** weird (with a category and an optional
-note). It **never edits the document** — fix the flagged blocks yourself in Word, then run `review`.
-The per-block labels are recorded as training data for a future "should this fix be applied?" model.
+note). Alongside each block it shows factual, non-judgmental notes — `vs peers:` (how the block's
+font/size differs from its role peers) and `vs neighbors:` (positional oddities such as a paragraph or
+heading wedged between two list items of the same list, or a list level that jumps by more than one) —
+so you can spot issues without the tool passing judgment. It **never edits the document** — fix the
+flagged blocks yourself in Word, then run `review`. The per-block labels are recorded as training data
+for a future "should this fix be applied?" model.
 
 ### Flags
 

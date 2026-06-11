@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 
 use crate::model::{
-    DocumentStyleProfile, IlvlIndentNorm, RelativeFeatures, RoleKey, RoleNorm, StyleCount,
-    StyleSignature, StyledBlock,
+    BlockKind, DocumentStyleProfile, IlvlIndentNorm, RelativeFeatures, RoleKey, RoleNorm,
+    StyleCount, StyleSignature, StyledBlock,
 };
 
 /// Build the descriptive style profile for a document's blocks.
@@ -131,6 +131,100 @@ pub fn deviation_notes(
     }
 
     notes
+}
+
+/// Factual, non-judgmental "vs neighbors" notes for a block: each names a structural fact about how
+/// the block sits relative to its *immediate neighbors* in document order — a different axis from
+/// [`deviation_notes`], which compares a block against its role peers. Never a verdict; empty when
+/// nothing positional stands out. `blocks` is the document (or the in-scope slice) in order; `block`
+/// must be one of them. Neighbors are the blocks adjacent to `block` within `blocks` (located by
+/// `block_index`, so a `--pages` subset still works — adjacency is then within that subset).
+///
+/// Three high-precision anomalies fire (design v9); each is a case where the neighbors make the
+/// block's structure self-contradictory:
+/// - a **paragraph** wedged between two list items of the same list,
+/// - a **heading** wedged between two list items of the same list,
+/// - a list item whose nesting **level jumps by more than one** from the previous same-list item.
+///
+/// Deliberately silent (too often legitimate): a lone list item among paragraphs, and a list ending
+/// where a different list begins.
+///
+/// ```
+/// use stencil::model::{BlockKind, Numbering, ParaStyle, StyledBlock};
+/// use stencil::style::profile::positional_notes;
+///
+/// let list = |index, num_id| StyledBlock {
+///     block_index: index,
+///     block_kind: BlockKind::ListItem,
+///     para: ParaStyle {
+///         numbering: Numbering { num_id: Some(num_id), ilvl: Some(0) },
+///         ..ParaStyle::default()
+///     },
+///     ..StyledBlock::default()
+/// };
+/// let orphan = StyledBlock { block_index: 1, ..StyledBlock::default() }; // a plain paragraph
+/// let blocks = [list(0, 3), orphan, list(2, 3)];
+/// assert_eq!(
+///     positional_notes(&blocks[1], &blocks),
+///     vec!["paragraph interrupts list 3 (between two list items)".to_string()],
+/// );
+/// ```
+pub fn positional_notes(block: &StyledBlock, blocks: &[StyledBlock]) -> Vec<String> {
+    let Some(pos) = blocks
+        .iter()
+        .position(|other| other.block_index == block.block_index)
+    else {
+        return Vec::new();
+    };
+    let prev = pos.checked_sub(1).and_then(|index| blocks.get(index));
+    let next = blocks.get(pos + 1);
+
+    let mut notes = Vec::new();
+
+    // Orphan breaking a list run: a paragraph or heading sitting between two list items of the same
+    // list. The block's own kind picks the wording; the two are mutually exclusive.
+    if matches!(block.block_kind, BlockKind::Paragraph | BlockKind::Heading)
+        && let (Some(prev), Some(next)) = (prev, next)
+        && let (Some(prev_num), Some(next_num)) = (list_num_id(prev), list_num_id(next))
+        && prev_num == next_num
+    {
+        let lead = if block.block_kind == BlockKind::Heading {
+            "heading inside"
+        } else {
+            "paragraph interrupts"
+        };
+        notes.push(format!("{lead} list {prev_num} (between two list items)"));
+    }
+
+    // Nesting-level jump: a list item whose level is more than one deeper than the previous item of
+    // the same list. Only deeper jumps are flagged (per requirements); a missing ilvl reads as 0.
+    if let (Some(level), Some(prev)) = (list_level(block), prev)
+        && list_num_id(prev) == list_num_id(block)
+        && let Some(prev_level) = list_level(prev)
+        && level > prev_level + 1
+    {
+        notes.push(format!("list level jumps {prev_level}→{level}"));
+    }
+
+    notes
+}
+
+/// The numbering id of a block when it is a list item; `None` for any other kind (a numbered
+/// heading is a [`BlockKind::Heading`], not a list item, so it is excluded here).
+fn list_num_id(block: &StyledBlock) -> Option<usize> {
+    match block.block_kind {
+        BlockKind::ListItem => block.para.numbering.num_id,
+        _ => None,
+    }
+}
+
+/// The nesting level of a list-item block, treating an unset `ilvl` as level 0 (matching the
+/// extractor's `ilvl.unwrap_or(0)`); `None` for any non-list block.
+fn list_level(block: &StyledBlock) -> Option<usize> {
+    match block.block_kind {
+        BlockKind::ListItem => Some(block.para.numbering.ilvl.unwrap_or(0)),
+        _ => None,
+    }
 }
 
 /// A short human label for a role, used in deviation notes (`H2`, `body`, `list items`, …).
@@ -574,6 +668,106 @@ mod tests {
         assert!(
             notes.iter().any(|note| note.contains("segments bold")),
             "expected a mixed-segments note, got: {notes:?}"
+        );
+    }
+
+    fn list_item(index: usize, num_id: usize, ilvl: usize) -> StyledBlock {
+        StyledBlock {
+            block_index: index,
+            block_kind: BlockKind::ListItem,
+            para: ParaStyle {
+                numbering: Numbering {
+                    num_id: Some(num_id),
+                    ilvl: Some(ilvl),
+                },
+                ..ParaStyle::default()
+            },
+            ..StyledBlock::default()
+        }
+    }
+
+    fn heading_block(index: usize) -> StyledBlock {
+        StyledBlock {
+            block_index: index,
+            block_kind: BlockKind::Heading,
+            heading_level: Some(1),
+            ..StyledBlock::default()
+        }
+    }
+
+    fn para_block(index: usize) -> StyledBlock {
+        StyledBlock {
+            block_index: index,
+            block_kind: BlockKind::Paragraph,
+            ..StyledBlock::default()
+        }
+    }
+
+    #[test]
+    fn positional_notes_flags_paragraph_orphan_in_list() {
+        let blocks = [list_item(0, 2, 0), para_block(1), list_item(2, 2, 0)];
+        assert_eq!(
+            positional_notes(&blocks[1], &blocks),
+            vec!["paragraph interrupts list 2 (between two list items)".to_string()]
+        );
+    }
+
+    #[test]
+    fn positional_notes_flags_heading_inside_list() {
+        let blocks = [list_item(0, 2, 0), heading_block(1), list_item(2, 2, 0)];
+        assert_eq!(
+            positional_notes(&blocks[1], &blocks),
+            vec!["heading inside list 2 (between two list items)".to_string()]
+        );
+    }
+
+    #[test]
+    fn positional_notes_flags_nesting_level_jump() {
+        // 0 → 2 skips a level; the second item is flagged, the first (no prior item) is not.
+        let blocks = [list_item(0, 2, 0), list_item(1, 2, 2)];
+        assert_eq!(
+            positional_notes(&blocks[1], &blocks),
+            vec!["list level jumps 0→2".to_string()]
+        );
+        assert!(positional_notes(&blocks[0], &blocks).is_empty());
+    }
+
+    #[test]
+    fn positional_notes_silent_for_single_level_step() {
+        let blocks = [list_item(0, 2, 0), list_item(1, 2, 1)];
+        assert!(positional_notes(&blocks[1], &blocks).is_empty());
+    }
+
+    #[test]
+    fn positional_notes_silent_across_different_lists() {
+        // A paragraph between two *different* lists is a normal section break, not an orphan.
+        let blocks = [list_item(0, 2, 0), para_block(1), list_item(2, 5, 0)];
+        assert!(positional_notes(&blocks[1], &blocks).is_empty());
+    }
+
+    #[test]
+    fn positional_notes_silent_for_lone_list_item() {
+        // A single list item among paragraphs is held back (one-item lists are often legitimate).
+        let blocks = [para_block(0), list_item(1, 2, 0), para_block(2)];
+        assert!(positional_notes(&blocks[1], &blocks).is_empty());
+    }
+
+    #[test]
+    fn positional_notes_silent_at_document_boundaries() {
+        // A block with no neighbor on one side cannot interrupt a run.
+        let blocks = [para_block(0), list_item(1, 2, 0)];
+        assert!(positional_notes(&blocks[0], &blocks).is_empty());
+        assert!(positional_notes(&blocks[1], &blocks).is_empty());
+    }
+
+    #[test]
+    fn positional_notes_locate_neighbors_within_a_subset() {
+        // Under `--pages` the slice is a subset whose positions differ from `block_index`;
+        // neighbors are still resolved correctly by locating the block within the slice.
+        let blocks = [list_item(7, 2, 0), para_block(8), list_item(9, 2, 0)];
+        assert_eq!(
+            positional_notes(&blocks[1], &blocks),
+            vec!["paragraph interrupts list 2 (between two list items)".to_string()]
         );
     }
 }

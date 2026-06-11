@@ -16,7 +16,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, rea
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use crate::model::{DocumentStyleProfile, EffectiveRun, IndentTwips, StyledBlock};
-use crate::style::profile::deviation_notes;
+use crate::style::profile::{deviation_notes, positional_notes};
 
 /// The weird-category menu: a key per category the reviewer can assign.
 const CATEGORY_MENU: &[(char, &str)] = &[
@@ -123,8 +123,16 @@ pub fn review(
     let mut index = 0;
     while index < total {
         let block = &blocks[index];
-        let notes = deviation_notes(block, blocks, profile);
-        prompt(&mut out, index + 1, total, block, &notes)?;
+        let peer_notes = deviation_notes(block, blocks, profile);
+        let neighbor_notes = positional_notes(block, blocks);
+        prompt(
+            &mut out,
+            index + 1,
+            total,
+            block,
+            &peer_notes,
+            &neighbor_notes,
+        )?;
         match read_action()? {
             Action::Fine => {
                 decided[index] = Some(StyleVerdict::Fine);
@@ -261,13 +269,15 @@ fn read_note(out: &mut impl Write) -> Result<Option<String>> {
 /// Print the prompt for one block: its position and kind, then (each on its own blank-line-separated
 /// row) an unlabeled text preview, its effective styling (a per-segment breakdown when mixed, else a
 /// single style line), its list/indent structure (marker, nesting level, indent — when it applies),
-/// and the factual "vs peers" notes.
+/// and the factual notes — `vs peers:` (role-peer style deviations) then `vs neighbors:` (positional
+/// structure relative to adjacent blocks).
 fn prompt(
     out: &mut impl Write,
     index: usize,
     total: usize,
     block: &StyledBlock,
-    notes: &[String],
+    peer_notes: &[String],
+    neighbor_notes: &[String],
 ) -> Result<()> {
     write_line(out, "")?;
     write_line(
@@ -290,10 +300,25 @@ fn prompt(
     for line in structure_lines(block) {
         write_line(out, &line)?;
     }
-    for note in notes {
-        write_line(out, &format!("   vs peers: {note}"))?;
+    for line in note_lines(peer_notes, neighbor_notes) {
+        write_line(out, &line)?;
     }
     Ok(())
+}
+
+/// The factual note lines for a block: `vs peers:` (role-peer style deviations) first, then
+/// `vs neighbors:` (positional structure vs. adjacent blocks), each indented for display. Pure, so
+/// it is unit-testable without a TTY.
+fn note_lines(peer_notes: &[String], neighbor_notes: &[String]) -> Vec<String> {
+    peer_notes
+        .iter()
+        .map(|note| format!("   vs peers: {note}"))
+        .chain(
+            neighbor_notes
+                .iter()
+                .map(|note| format!("   vs neighbors: {note}")),
+        )
+        .collect()
 }
 
 /// A single-line, length-capped preview of text.
@@ -690,5 +715,23 @@ mod tests {
         let lines = style_lines(&block);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("unknown"));
+    }
+
+    #[test]
+    fn note_lines_render_peers_then_neighbors() {
+        let peers = vec!["font Calibri — 3 of 4 other H2 use Arial".to_string()];
+        let neighbors = vec!["paragraph interrupts list 3 (between two list items)".to_string()];
+        assert_eq!(
+            note_lines(&peers, &neighbors),
+            vec![
+                "   vs peers: font Calibri — 3 of 4 other H2 use Arial".to_string(),
+                "   vs neighbors: paragraph interrupts list 3 (between two list items)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn note_lines_empty_when_no_notes() {
+        assert!(note_lines(&[], &[]).is_empty());
     }
 }

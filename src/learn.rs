@@ -37,9 +37,10 @@ const DECISION_SCHEMA: u32 = 4;
 
 /// Schema version stamped on each `styling.jsonl` record. Schema 2 (v7) adds `doc_id` + `lang`.
 /// Schema 3 (v8) adds the per-segment `segments` breakdown (effective styling), `numbering_format`,
-/// and the `style_unresolved`/`numbering_unresolved` flags, and drops `run.mixed` (now derivable);
-/// schema-2 lines still deserialize via `#[serde(default)]`.
-const STYLING_SCHEMA: u32 = 3;
+/// and the `style_unresolved`/`numbering_unresolved` flags, and drops `run.mixed` (now derivable).
+/// Schema 4 (v9) enriches `context` with the neighbors' structure (each neighbor's `block_kind` +
+/// numbering); older lines still deserialize via `#[serde(default)]`.
+const STYLING_SCHEMA: u32 = 4;
 
 /// Max chars kept on each side of the placeholder when growing the sentence window — a
 /// safety net so a terminator-less run can't capture an unbounded span.
@@ -368,11 +369,30 @@ pub struct RelativeStyle {
     pub indent_vs_ilvl_norm: Option<f32>,
 }
 
-/// The text of the neighboring blocks, for peer judgment at review time.
+/// The neighboring blocks' text and structure, for positional judgment at review/training time.
+///
+/// Schema 4 (v9) adds the structural fields: each neighbor's `block_kind` label (`None` at a document
+/// edge — no neighbor on that side) and, when that neighbor is a list item, its numbering
+/// (`num_id` + `ilvl`). These are the raw facts behind
+/// [`crate::style::profile::positional_notes`]; positional anomalies are derived from them, never
+/// frozen into the append-only log.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NeighborContext {
     pub prev_text: String,
     pub next_text: String,
+    /// The previous block's kind (`paragraph`/`heading`/`list_item`/`table_cell`); `None` at the
+    /// document start (schema 4).
+    #[serde(default)]
+    pub prev_kind: Option<String>,
+    /// The next block's kind; `None` at the document end (schema 4).
+    #[serde(default)]
+    pub next_kind: Option<String>,
+    /// The previous block's numbering when it is a list item; `None` otherwise (schema 4).
+    #[serde(default)]
+    pub prev_numbering: Option<Numbering>,
+    /// The next block's numbering when it is a list item; `None` otherwise (schema 4).
+    #[serde(default)]
+    pub next_numbering: Option<Numbering>,
 }
 
 /// One row of the append-only styling log — a labeled training example for the future styling
@@ -828,15 +848,23 @@ mod tests {
             context: NeighborContext {
                 prev_text: "prev".into(),
                 next_text: "next".into(),
+                prev_kind: Some("list_item".into()),
+                next_kind: Some("paragraph".into()),
+                prev_numbering: Some(Numbering {
+                    num_id: Some(2),
+                    ilvl: Some(0),
+                }),
+                next_numbering: None,
             },
             verdict: "weird".into(),
             category: Some("wrong-style-for-role".into()),
             note: Some("title as paragraph".into()),
         };
         let json = serde_json::to_string(&record).expect("serialize");
-        assert!(json.contains("\"schema\":3"));
+        assert!(json.contains("\"schema\":4"));
         assert!(json.contains("\"doc_id\":\"deadbeefcafe0001\""));
         assert!(json.contains("\"lang\":\"en\""));
+        assert!(json.contains("\"prev_kind\":\"list_item\""));
         let back: StylingRecord = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, record);
     }
@@ -855,6 +883,18 @@ mod tests {
         );
         assert!(!record.style_unresolved);
         assert_eq!(record.numbering_format, None);
+    }
+
+    #[test]
+    fn schema_3_styling_row_still_parses_without_neighbor_structure() {
+        // A v8 (schema 3) row's `context` carries only text; the schema-4 neighbor structure
+        // (prev/next kind + numbering) defaults to None rather than erroring.
+        let line = r#"{"schema":3,"source":"c.docx","doc_id":"id","lang":"en","lang_confidence":0.9,"block_index":1,"block_kind":"paragraph","heading_level":null,"in_table":false,"text":"x","para":{"style_name":null,"alignment":null,"indent":{},"numbering":null,"spacing":{}},"run":{"font":"Arial","size_half_pt":22,"bold":false,"italic":false,"underline":null,"color":null},"segments":[],"numbering_format":null,"style_unresolved":false,"numbering_unresolved":false,"relative":{},"context":{"prev_text":"a","next_text":"b"},"verdict":"fine","category":null,"note":null}"#;
+        let record: StylingRecord = serde_json::from_str(line).expect("schema-3 row parses");
+        assert_eq!(record.schema, 3);
+        assert_eq!(record.context.prev_text, "a");
+        assert_eq!(record.context.prev_kind, None);
+        assert_eq!(record.context.next_numbering, None);
     }
 
     #[test]

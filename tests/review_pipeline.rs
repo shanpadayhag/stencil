@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use docx_rs::{Docx, Paragraph, Run, RunFonts};
+use docx_rs::{Docx, IndentLevel, NumberingId, Paragraph, Run, RunFonts};
 
 use stencil::censor::{self, CensorDecision, CensorOptions, ReviewItem, ValueType, Verdict};
 use stencil::extract;
@@ -344,6 +344,111 @@ fn styling_pipeline_writes_censored_jsonl_and_profile_sidecar() {
         serde_json::from_str(&fs::read_to_string(&sidecar).expect("read sidecar"))
             .expect("parse profile sidecar");
     assert_eq!(back, profile);
+
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_dir_all(&data);
+}
+
+#[test]
+fn styling_pipeline_fires_orphan_note_and_persists_neighbor_structure() {
+    // A list run with a plain paragraph wedged in the middle — an accidental Enter dropped its
+    // numbering. v9 should both surface the `vs neighbors:` note and persist the neighbor structure.
+    let path = unique("orphan").with_extension("docx");
+    pack(
+        Docx::new()
+            .add_paragraph(
+                Paragraph::new()
+                    .numbering(NumberingId::new(3), IndentLevel::new(0))
+                    .add_run(Run::new().add_text("First obligation.")),
+            )
+            .add_paragraph(
+                Paragraph::new().add_run(Run::new().add_text("This clause was split off.")),
+            )
+            .add_paragraph(
+                Paragraph::new()
+                    .numbering(NumberingId::new(3), IndentLevel::new(0))
+                    .add_run(Run::new().add_text("Second obligation.")),
+            ),
+        &path,
+    );
+
+    let blocks = style::extract::from_path(&path).expect("extract styled blocks");
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(blocks[0].block_kind, stencil::model::BlockKind::ListItem);
+    assert_eq!(blocks[1].block_kind, stencil::model::BlockKind::Paragraph);
+    assert_eq!(blocks[2].block_kind, stencil::model::BlockKind::ListItem);
+
+    // The review surfaces the orphan note for the wedged paragraph; the list items are clean.
+    assert_eq!(
+        style::profile::positional_notes(&blocks[1], &blocks),
+        vec!["paragraph interrupts list 3 (between two list items)".to_string()],
+    );
+    assert!(style::profile::positional_notes(&blocks[0], &blocks).is_empty());
+
+    // Persist all three (synthetic reviewer: the orphan is weird, the items fine) and read back.
+    let profile = style::profile::build_profile(&blocks);
+    let decisions = vec![
+        StyleDecision {
+            block_index: 0,
+            verdict: StyleVerdict::Fine,
+        },
+        StyleDecision {
+            block_index: 1,
+            verdict: StyleVerdict::Weird {
+                category: "wrong-style-for-role".to_string(),
+                note: Some("orphaned list item".to_string()),
+            },
+        },
+        StyleDecision {
+            block_index: 2,
+            verdict: StyleVerdict::Fine,
+        },
+    ];
+
+    let data = unique("orphan_data");
+    let log_path = data.join("styling.jsonl");
+    let profiles_dir = data.join("profiles");
+    style::record::persist(
+        &log_path,
+        &profiles_dir,
+        &blocks,
+        &profile,
+        &decisions,
+        &path,
+        "orphandocid00001",
+    )
+    .expect("persist styling");
+
+    let logged: Vec<StylingRecord> = fs::read_to_string(&log_path)
+        .expect("read styling log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse styling record"))
+        .collect();
+    assert!(logged.iter().all(|r| r.schema == learn::styling_schema()));
+
+    // The orphan row carries the raw neighbor structure: both sides are list items of the same list.
+    let orphan = logged
+        .iter()
+        .find(|r| r.block_index == 1)
+        .expect("orphan row");
+    assert_eq!(orphan.context.prev_kind.as_deref(), Some("list_item"));
+    assert_eq!(orphan.context.next_kind.as_deref(), Some("list_item"));
+    assert_eq!(
+        orphan
+            .context
+            .prev_numbering
+            .as_ref()
+            .and_then(|n| n.num_id),
+        Some(3)
+    );
+    assert_eq!(
+        orphan
+            .context
+            .next_numbering
+            .as_ref()
+            .and_then(|n| n.num_id),
+        Some(3)
+    );
 
     let _ = fs::remove_file(&path);
     let _ = fs::remove_dir_all(&data);
