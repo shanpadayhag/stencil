@@ -15,7 +15,7 @@ use anyhow::{Result, bail};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, read};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
-use crate::model::{DocumentStyleProfile, EffectiveRun, StyledBlock};
+use crate::model::{DocumentStyleProfile, EffectiveRun, IndentTwips, StyledBlock};
 use crate::style::profile::deviation_notes;
 
 /// The weird-category menu: a key per category the reviewer can assign.
@@ -258,8 +258,10 @@ fn read_note(out: &mut impl Write) -> Result<Option<String>> {
     Ok((!note.is_empty()).then(|| note.to_string()))
 }
 
-/// Print the prompt for one block: its position, kind, a text preview, its effective styling (a
-/// per-segment breakdown when mixed, else a single style line), and the factual "vs peers" notes.
+/// Print the prompt for one block: its position and kind, then (each on its own blank-line-separated
+/// row) an unlabeled text preview, its effective styling (a per-segment breakdown when mixed, else a
+/// single style line), its list/indent structure (marker, nesting level, indent — when it applies),
+/// and the factual "vs peers" notes.
 fn prompt(
     out: &mut impl Write,
     index: usize,
@@ -279,8 +281,13 @@ fn prompt(
                 .unwrap_or_default(),
         ),
     )?;
-    write_line(out, &format!("   text: {}", preview(&block.text)))?;
+    write_line(out, "")?;
+    write_line(out, &format!("   {}", preview(&block.text)))?;
+    write_line(out, "")?;
     for line in style_lines(block) {
+        write_line(out, &line)?;
+    }
+    for line in structure_lines(block) {
         write_line(out, &line)?;
     }
     for note in notes {
@@ -299,6 +306,70 @@ fn preview(text: &str) -> String {
     } else {
         one_line
     }
+}
+
+/// The structural lines for a block: a single `list:` line when the block participates in a
+/// numbered or bulleted list (marker, nesting level, physical indent), otherwise a plain `indent:`
+/// line when the paragraph is merely indented. Empty for an ordinary, unindented block.
+fn structure_lines(block: &StyledBlock) -> Vec<String> {
+    if let Some(line) = list_line(block) {
+        return vec![line];
+    }
+    match indent_summary(&block.para.indent_twips) {
+        Some(indent) => vec![format!("   indent: {indent}")],
+        None => Vec::new(),
+    }
+}
+
+/// The `list:` line for a block carrying a numbering reference: the marker (a bullet, or the number
+/// format with its level-text template), the 0-based nesting `level` (`ilvl`), and the physical
+/// indent. `None` when the block has no numbering at all. Numbering whose format could not be
+/// resolved still produces a line — flagged as such, never silently dropped.
+fn list_line(block: &StyledBlock) -> Option<String> {
+    let numbering = &block.para.numbering;
+    if numbering.num_id.is_none() && !block.numbering_unresolved {
+        return None;
+    }
+    let marker = match &block.numbering_format {
+        Some(format) if format.kind.eq_ignore_ascii_case("bullet") => "bullet".to_string(),
+        Some(format) => format!("{} (\"{}\")", format.kind, format.level_text),
+        None => "(format unresolved)".to_string(),
+    };
+    let mut parts = vec![marker];
+    if let Some(ilvl) = numbering.ilvl {
+        parts.push(format!("level {ilvl}"));
+    }
+    if let Some(indent) = indent_summary(&block.para.indent_twips) {
+        parts.push(format!("indent {indent}"));
+    }
+    Some(format!("   list: {}", parts.join(" · ")))
+}
+
+/// A compact, human-readable summary of a paragraph's indentation, each measure in inches; `None`
+/// when no indent is set.
+fn indent_summary(indent: &IndentTwips) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(left) = indent.left {
+        parts.push(format!("left {}", inches(left)));
+    }
+    if let Some(hanging) = indent.hanging {
+        parts.push(format!("hanging {}", inches(hanging)));
+    }
+    if let Some(first_line) = indent.first_line {
+        parts.push(format!("first-line {}", inches(first_line)));
+    }
+    if let Some(right) = indent.right {
+        parts.push(format!("right {}", inches(right)));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// Format a twips measurement (1440 twips = 1 inch) as trimmed inches, e.g. `720` → `0.5"`.
+fn inches(twips: i32) -> String {
+    let value = f64::from(twips) / 1440.0;
+    let formatted = format!("{value:.2}");
+    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+    format!("{trimmed}\"")
 }
 
 /// The styling display lines for a block: a `segments:` bullet list when the block has ≥2 distinct
@@ -384,7 +455,9 @@ impl Drop for RawModeGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BlockKind, ParaStyle, StyleSegment};
+    use crate::model::{
+        BlockKind, IndentTwips, Numbering, NumberingFormat, ParaStyle, StyleSegment,
+    };
 
     fn segment(text: &str, style: EffectiveRun) -> StyleSegment {
         StyleSegment {
@@ -504,6 +577,107 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert!(lines[1].contains("\"Plain\"") && lines[1].contains("(inherited)"));
         assert!(lines[2].contains("\"bold\"") && lines[2].contains("bold"));
+    }
+
+    #[test]
+    fn inches_trims_trailing_zeros() {
+        assert_eq!(inches(720), "0.5\"");
+        assert_eq!(inches(1440), "1\"");
+        assert_eq!(inches(360), "0.25\"");
+        assert_eq!(inches(0), "0\"");
+    }
+
+    #[test]
+    fn list_line_shows_bullet_level_and_indent() {
+        let block = StyledBlock {
+            block_kind: BlockKind::ListItem,
+            para: ParaStyle {
+                numbering: Numbering {
+                    num_id: Some(2),
+                    ilvl: Some(1),
+                },
+                indent_twips: IndentTwips {
+                    left: Some(720),
+                    hanging: Some(360),
+                    ..IndentTwips::default()
+                },
+                ..ParaStyle::default()
+            },
+            numbering_format: Some(NumberingFormat {
+                kind: "bullet".into(),
+                level_text: String::new(),
+            }),
+            ..StyledBlock::default()
+        };
+        let line = list_line(&block).expect("a list item has a list line");
+        assert!(line.contains("list:"));
+        assert!(line.contains("bullet"));
+        assert!(line.contains("level 1"));
+        assert!(line.contains("indent left 0.5\""));
+        assert!(line.contains("hanging 0.25\""));
+    }
+
+    #[test]
+    fn list_line_shows_number_format_and_template() {
+        let block = StyledBlock {
+            block_kind: BlockKind::ListItem,
+            para: ParaStyle {
+                numbering: Numbering {
+                    num_id: Some(3),
+                    ilvl: Some(0),
+                },
+                ..ParaStyle::default()
+            },
+            numbering_format: Some(NumberingFormat {
+                kind: "decimal".into(),
+                level_text: "%1.".into(),
+            }),
+            ..StyledBlock::default()
+        };
+        let line = list_line(&block).expect("list line");
+        assert!(line.contains("decimal (\"%1.\")"), "got: {line}");
+        assert!(line.contains("level 0"));
+    }
+
+    #[test]
+    fn list_line_flags_unresolved_numbering() {
+        let block = StyledBlock {
+            block_kind: BlockKind::ListItem,
+            para: ParaStyle {
+                numbering: Numbering {
+                    num_id: Some(9),
+                    ilvl: Some(2),
+                },
+                ..ParaStyle::default()
+            },
+            numbering_format: None,
+            numbering_unresolved: true,
+            ..StyledBlock::default()
+        };
+        let line = list_line(&block).expect("a list line even when the format is unresolved");
+        assert!(line.contains("format unresolved"), "got: {line}");
+        assert!(line.contains("level 2"));
+    }
+
+    #[test]
+    fn structure_lines_shows_indent_for_non_list_paragraph() {
+        let block = StyledBlock {
+            para: ParaStyle {
+                indent_twips: IndentTwips {
+                    left: Some(1440),
+                    ..IndentTwips::default()
+                },
+                ..ParaStyle::default()
+            },
+            ..StyledBlock::default()
+        };
+        let lines = structure_lines(&block);
+        assert_eq!(lines, vec!["   indent: left 1\"".to_string()]);
+    }
+
+    #[test]
+    fn structure_lines_empty_for_plain_paragraph() {
+        assert!(structure_lines(&StyledBlock::default()).is_empty());
     }
 
     #[test]
