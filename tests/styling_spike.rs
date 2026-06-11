@@ -14,8 +14,19 @@
 //!   underline     → `/underline`    (string, e.g. "single")
 //!   color         → `/color`        (string, hex RGB)
 //! Complex-script twins `boldCs`/`italicCs`/`szCs` also appear; T28 reads the primary keys.
+//!
+//! T45 (v8) additions — same `run_property` JSON (`rename_all = "camelCase"`), proven below:
+//!   strikethrough     → `/strike`            (bool; `dstrike` is the double-strike twin)
+//!   character spacing → `/characterSpacing`  (i32, **twentieths of a point**; negative = condensed)
+//!   all-caps          → `/caps`              (bool)
+//! Limitations found in docx-rs 0.4.20 (fed back into the v8 design):
+//!   - **small-caps is NOT modeled** — no `smallCaps`/`small_caps` field exists on `RunProperty`, so
+//!     it cannot be captured without a docx-rs upgrade or custom XML. The v8 catalog drops it.
+//!   - `Run` has no `caps()` builder (only `RunProperty::caps()`). This is irrelevant to extraction —
+//!     which reads the parsed `RunProperty` regardless of how it was authored — but it's why the caps
+//!     fixture sets `run_property` directly instead of chaining a `Run` builder.
 
-use docx_rs::{Docx, Paragraph, ParagraphChild, Run, RunFonts, read_docx};
+use docx_rs::{Docx, Paragraph, ParagraphChild, Run, RunFonts, RunProperty, read_docx};
 use std::fs;
 
 /// Build a one-run `.docx` from `make_run`, pack/read it back, and return the first run's
@@ -91,4 +102,40 @@ fn unstyled_run_omits_the_keys() {
     assert!(v.get("bold").is_none(), "unset bold is omitted, got: {v}");
     assert!(v.get("sz").is_none(), "unset size is omitted, got: {v}");
     assert!(v.get("fonts").is_none(), "unset fonts is omitted, got: {v}");
+}
+
+#[test]
+fn strike_and_character_spacing_survive_round_trip() {
+    // Both have `Run` builders; condensed spacing is a negative value in twentieths of a point
+    // (Word's "Condensed by 0.15pt" → -3). The resolver (T47/T48) reads these keys off the parsed
+    // RunProperty exactly as it reads bold/size today.
+    let v = first_run_property_json("strike_spacing", |run| run.strike().character_spacing(-3));
+
+    assert_eq!(
+        v.get("strike").and_then(|b| b.as_bool()),
+        Some(true),
+        "strikethrough reachable at /strike (bool), got: {v}"
+    );
+    assert_eq!(
+        v.get("characterSpacing").and_then(|n| n.as_i64()),
+        Some(-3),
+        "character spacing reachable at /characterSpacing (i32, 20ths of a pt; negative = condensed), got: {v}"
+    );
+}
+
+#[test]
+fn caps_reads_back_at_the_caps_key() {
+    // `Run` has no caps() builder, so author it on the RunProperty directly. What matters is that a
+    // parsed document exposes caps at `/caps` as a bool — which is what the resolver consumes.
+    let v = first_run_property_json("caps", |run| {
+        let mut run = run;
+        run.run_property = RunProperty::new().caps();
+        run
+    });
+
+    assert_eq!(
+        v.get("caps").and_then(|b| b.as_bool()),
+        Some(true),
+        "all-caps reachable at /caps (bool), got: {v}"
+    );
 }

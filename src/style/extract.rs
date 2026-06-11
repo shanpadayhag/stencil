@@ -3,21 +3,27 @@
 //! Paragraph-level properties (style id, alignment, indent, numbering) come from the
 //! docx-rs public API. Run-level properties (font, size, bold, …) and paragraph spacing
 //! live in private fields with no getters, so they are read by serializing the structs
-//! to JSON and pulling the keys proven in the T23 spike (`tests/styling_spike.rs`); a
-//! docx-rs bump that renames them fails that spike loudly. Effective-style inheritance
-//! is deferred: only inline values plus the style id are recorded.
+//! to JSON and pulling the keys proven in the T23/T45 spikes (`tests/styling_spike.rs`); a
+//! docx-rs bump that renames them fails those spikes loudly. Each run is resolved to its
+//! *effective* styling through [`crate::style::resolve`] (style chain + numbering tables) and the
+//! block is split into coalesced [`StyleSegment`]s; the representative [`RunStyle`] is the dominant
+//! segment, and a missing style/numbering reference sets the block's `*_unresolved` flag.
 
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use docx_rs::{
-    DocumentChild, Docx, Indent, LineSpacing, NumberingProperty, Paragraph, ParagraphChild, Run,
-    RunChild, SpecialIndentType, TableCellContent, TableChild, TableRowChild, read_docx,
+    DocumentChild, Docx, Indent, LineSpacing, NumberingProperty, Numberings, Paragraph,
+    ParagraphChild, Run, RunChild, SpecialIndentType, Styles, TableCellContent, TableChild,
+    TableRowChild, read_docx,
 };
 use serde_json::Value;
 
-use crate::model::{BlockKind, IndentTwips, Numbering, ParaStyle, RunStyle, Spacing, StyledBlock};
+use crate::model::{
+    BlockKind, IndentTwips, Numbering, ParaStyle, RunStyle, Spacing, StyleSegment, StyledBlock,
+};
+use crate::style::resolve::{resolve_numbering, resolve_para, resolve_run};
 
 /// Read a `.docx` file and extract one [`StyledBlock`] per visible block, in order.
 ///
@@ -46,7 +52,14 @@ fn styled_blocks(docx: &Docx) -> Vec<StyledBlock> {
                 if starts_new_page(paragraph) {
                     page += 1;
                 }
-                push_paragraph(&mut blocks, paragraph, false, page);
+                push_paragraph(
+                    &mut blocks,
+                    paragraph,
+                    false,
+                    page,
+                    &docx.styles,
+                    &docx.numberings,
+                );
                 if paragraph_has_page_break(paragraph) {
                     page += 1;
                 }
@@ -56,7 +69,14 @@ fn styled_blocks(docx: &Docx) -> Vec<StyledBlock> {
                     for TableRowChild::TableCell(cell) in &row.cells {
                         for content in &cell.children {
                             if let TableCellContent::Paragraph(paragraph) = content {
-                                push_paragraph(&mut blocks, paragraph, true, page);
+                                push_paragraph(
+                                    &mut blocks,
+                                    paragraph,
+                                    true,
+                                    page,
+                                    &docx.styles,
+                                    &docx.numberings,
+                                );
                             }
                         }
                     }
@@ -69,15 +89,43 @@ fn styled_blocks(docx: &Docx) -> Vec<StyledBlock> {
 }
 
 /// Append the styled block for `paragraph` (unless it is empty), assigning the next index and
-/// its `page`.
-fn push_paragraph(blocks: &mut Vec<StyledBlock>, paragraph: &Paragraph, in_table: bool, page: u32) {
+/// its `page`. Run and numbering styling are resolved to their *effective* values against the
+/// document's `styles` and `numberings` tables.
+fn push_paragraph(
+    blocks: &mut Vec<StyledBlock>,
+    paragraph: &Paragraph,
+    in_table: bool,
+    page: u32,
+    styles: &Styles,
+    numberings: &Numberings,
+) {
     let text = paragraph_text(paragraph);
     if text.trim().is_empty() {
         return;
     }
     let heading_level = heading_level(paragraph);
-    let para = para_style(paragraph);
+    let mut para = para_style(paragraph);
     let block_kind = classify(in_table, heading_level, &para.numbering);
+
+    let (segments, run_unresolved) = build_segments(paragraph, para.style_name.as_deref(), styles);
+    let run = representative_run(&segments);
+
+    // Resolve effective paragraph properties (alignment / indent / line-spacing) through the style
+    // chain, replacing the inline-only values read above.
+    let resolved_para = resolve_para(&paragraph.property, styles);
+    para.alignment = resolved_para.alignment;
+    para.indent_twips = resolved_para.indent;
+    para.spacing = resolved_para.spacing;
+    let style_unresolved = run_unresolved || resolved_para.unresolved;
+    let (numbering_format, numbering_unresolved) = match para.numbering.num_id {
+        Some(num_id) => {
+            let format = resolve_numbering(num_id, para.numbering.ilvl.unwrap_or(0), numberings);
+            let unresolved = format.is_none();
+            (format, unresolved)
+        }
+        None => (None, false),
+    };
+
     blocks.push(StyledBlock {
         block_index: blocks.len(),
         block_kind,
@@ -85,7 +133,11 @@ fn push_paragraph(blocks: &mut Vec<StyledBlock>, paragraph: &Paragraph, in_table
         in_table,
         text,
         para,
-        run: run_style(paragraph),
+        run,
+        segments,
+        numbering_format,
+        style_unresolved,
+        numbering_unresolved,
         page,
         ..Default::default() // lang tagged by the styling stage after extraction
     });
@@ -164,67 +216,81 @@ fn spacing(line_spacing: &LineSpacing) -> Spacing {
     }
 }
 
-/// Per-run styling, used to detect disagreement within a block.
-#[derive(Clone, PartialEq, Eq)]
-struct RunProps {
-    font: Option<String>,
-    size_half_pt: Option<u64>,
-    bold: Option<bool>,
-    italic: Option<bool>,
-    underline: Option<String>,
-    color: Option<String>,
-}
-
-/// Read one run's styling via serde introspection, using the T23-proven key paths.
-fn run_props(run: &Run) -> RunProps {
-    let value = serde_json::to_value(&run.run_property).unwrap_or(Value::Null);
-    RunProps {
-        font: value
-            .pointer("/fonts/ascii")
-            .and_then(Value::as_str)
-            .map(String::from),
-        size_half_pt: value.get("sz").and_then(Value::as_u64),
-        bold: value.get("bold").and_then(Value::as_bool),
-        italic: value.get("italic").and_then(Value::as_bool),
-        underline: value
-            .get("underline")
-            .and_then(Value::as_str)
-            .map(String::from),
-        color: value.get("color").and_then(Value::as_str).map(String::from),
-    }
-}
-
-/// Aggregate a block's run styling: the first text-bearing run's values, with `mixed`
-/// set when any other text-bearing run disagrees.
-fn run_style(paragraph: &Paragraph) -> RunStyle {
-    let mut runs = Vec::with_capacity(paragraph.children.len());
-    for child in &paragraph.children {
-        if let ParagraphChild::Run(run) = child
-            && run_has_text(run)
-        {
-            runs.push(run_props(run));
+/// The visible text of a single run — text, tabs, and line breaks — in order.
+fn run_text(run: &Run) -> String {
+    let mut text = String::new();
+    for child in &run.children {
+        match child {
+            RunChild::Text(value) => text.push_str(&value.text),
+            RunChild::Tab(_) => text.push('\t'),
+            RunChild::Break(_) => text.push('\n'),
+            _ => {}
         }
     }
-    let Some(first) = runs.first() else {
-        return RunStyle::default();
-    };
-    let mixed = runs.iter().any(|props| props != first);
-    RunStyle {
-        font: first.font.clone(),
-        size_half_pt: first.size_half_pt,
-        bold: first.bold,
-        italic: first.italic,
-        underline: first.underline.clone(),
-        color: first.color.clone(),
-        mixed,
-    }
+    text
 }
 
-/// Whether a run contributes any non-empty visible text.
-fn run_has_text(run: &Run) -> bool {
-    run.children
+/// Split a paragraph into styling segments: resolve each run's effective styling, then coalesce
+/// adjacent runs that share it (a whitespace-only run joins its neighbour regardless of style).
+/// Returns the segments in order plus whether any run's style chain referenced a missing style.
+fn build_segments(
+    paragraph: &Paragraph,
+    paragraph_style: Option<&str>,
+    styles: &Styles,
+) -> (Vec<StyleSegment>, bool) {
+    let mut segments: Vec<StyleSegment> = Vec::new();
+    let mut unresolved = false;
+    for child in &paragraph.children {
+        let ParagraphChild::Run(run) = child else {
+            continue;
+        };
+        let text = run_text(run);
+        if text.is_empty() {
+            continue;
+        }
+        let resolved = resolve_run(&run.run_property, paragraph_style, styles);
+        unresolved |= resolved.unresolved;
+
+        let whitespace_only = text.trim().is_empty();
+        let join_previous = segments
+            .last()
+            .is_some_and(|last| last.style == resolved.run || whitespace_only);
+        if join_previous {
+            segments
+                .last_mut()
+                .expect("join_previous implies a previous segment")
+                .text
+                .push_str(&text);
+        } else {
+            segments.push(StyleSegment {
+                text,
+                style: resolved.run,
+            });
+        }
+    }
+    (segments, unresolved)
+}
+
+/// The block's representative run styling: the dominant (longest) segment's effective run narrowed
+/// to the inline [`RunStyle`] fields. Empty input yields the default. Mirrors
+/// [`crate::model::StyledBlock::dominant_segment`]'s longest-then-first-on-tie rule.
+fn representative_run(segments: &[StyleSegment]) -> RunStyle {
+    let Some(style) = segments
         .iter()
-        .any(|child| matches!(child, RunChild::Text(text) if !text.text.is_empty()))
+        .enumerate()
+        .max_by_key(|(index, segment)| (segment.text.chars().count(), std::cmp::Reverse(*index)))
+        .map(|(_, segment)| &segment.style)
+    else {
+        return RunStyle::default();
+    };
+    RunStyle {
+        font: style.font.clone(),
+        size_half_pt: style.size_half_pt,
+        bold: style.bold,
+        italic: style.italic,
+        underline: style.underline.clone(),
+        color: style.color.clone(),
+    }
 }
 
 /// Concatenate the visible text of a paragraph's runs, preserving tabs and breaks.
@@ -275,7 +341,7 @@ mod tests {
     use super::*;
     use docx_rs::{
         AlignmentType, Docx, IndentLevel, NumberingId, Paragraph as DocxParagraph, Run as DocxRun,
-        RunFonts, SpecialIndentType, Table, TableCell, TableRow,
+        RunFonts, SpecialIndentType, Style, StyleType, Table, TableCell, TableRow,
     };
 
     /// Pack a `Docx` to a temp file, read it back through the extractor, and return the
@@ -319,7 +385,12 @@ mod tests {
         assert_eq!(block.run.font.as_deref(), Some("Courier New"));
         assert_eq!(block.run.size_half_pt, Some(28));
         assert_eq!(block.run.bold, Some(true));
-        assert!(!block.run.mixed);
+        assert!(!block.is_mixed());
+        assert_eq!(
+            block.segments.len(),
+            1,
+            "one styled run is a single segment"
+        );
     }
 
     #[test]
@@ -395,8 +466,12 @@ mod tests {
         let blocks = round_trip(docx, "mixed");
 
         assert_eq!(blocks.len(), 1);
-        assert!(blocks[0].run.mixed);
-        // The first text-bearing run is unstyled, so its bold is unset.
+        assert!(
+            blocks[0].is_mixed(),
+            "two differently-styled runs are mixed"
+        );
+        assert_eq!(blocks[0].segments.len(), 2);
+        // The dominant (longest) segment is the unstyled "plain " run, so bold is unset.
         assert_eq!(blocks[0].run.bold, None);
     }
 
@@ -410,8 +485,59 @@ mod tests {
 
         let blocks = round_trip(docx, "uniform");
 
-        assert!(!blocks[0].run.mixed);
+        assert!(
+            !blocks[0].is_mixed(),
+            "identically-styled runs coalesce into one segment"
+        );
+        assert_eq!(blocks[0].segments.len(), 1);
         assert_eq!(blocks[0].run.bold, Some(true));
+    }
+
+    #[test]
+    fn paragraph_style_resolves_into_segments() {
+        // The run carries no direct formatting; its look comes entirely from the Heading2 style.
+        let docx = Docx::new()
+            .add_style(
+                Style::new("Heading2", StyleType::Paragraph)
+                    .fonts(RunFonts::new().ascii("Arial"))
+                    .size(26)
+                    .bold(),
+            )
+            .add_paragraph(
+                DocxParagraph::new()
+                    .style("Heading2")
+                    .add_run(DocxRun::new().add_text("Payment Terms")),
+            );
+
+        // `styled_blocks` resolves against the in-memory style table (no pack/read round-trip).
+        let blocks = styled_blocks(&docx);
+        let block = &blocks[0];
+        assert_eq!(block.segments.len(), 1);
+        let style = &block.segments[0].style;
+        assert_eq!(
+            style.font.as_deref(),
+            Some("Arial"),
+            "resolved from the style, not null"
+        );
+        assert_eq!(style.size_half_pt, Some(26));
+        assert_eq!(style.bold, Some(true));
+        // The representative run mirrors the dominant segment.
+        assert_eq!(block.run.font.as_deref(), Some("Arial"));
+        assert!(!block.style_unresolved);
+    }
+
+    #[test]
+    fn missing_style_reference_marks_block_unresolved() {
+        let docx = Docx::new().add_paragraph(
+            DocxParagraph::new()
+                .style("Ghost")
+                .add_run(DocxRun::new().add_text("x")),
+        );
+        let blocks = styled_blocks(&docx);
+        assert!(
+            blocks[0].style_unresolved,
+            "an undefined style id resolves to unknown, not a match"
+        );
     }
 
     #[test]

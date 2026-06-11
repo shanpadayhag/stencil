@@ -9,16 +9,14 @@
 //! norms stay accurate.
 
 use std::io::IsTerminal;
-use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use crate::censor::{self, CensorOptions};
 use crate::cli::StyleArgs;
 use crate::extract;
 use crate::lang;
 use crate::learn;
-use crate::model::{Block, Document, StyledBlock};
+use crate::model::StyledBlock;
 use crate::pages::PageSelection;
 use crate::style;
 use crate::style::review::{StyleVerdict, review as run_styling_review};
@@ -50,26 +48,29 @@ pub fn run(args: StyleArgs) -> Result<()> {
     // The id keying this document's styling records/profile (matches the `review` command's id).
     let doc_id = crate::doc_id::doc_id(&extract::from_path(&args.input)?);
 
-    // Detect language on the original text, then censor each block's text for safe display/logging.
+    // Tag each block with its detected language for the records.
     tag_block_languages(&mut blocks, lang_override(&args.lang));
-    censor_block_text(&mut blocks, &args.input);
 
     // Profile over the whole document (accurate norms); review only the in-scope blocks.
     let profile = style::profile::build_profile(&blocks);
-    let reviewed: Vec<StyledBlock> = match &selection {
-        Some(sel) => blocks
-            .iter()
-            .filter(|block| sel.contains(block.page))
-            .cloned()
-            .collect(),
-        None => blocks.clone(),
+    let decisions = match &selection {
+        // Scoped to `--pages`: review just those blocks. This is the only path that can be empty,
+        // since the whole-document case already bailed above when there were no blocks.
+        Some(sel) => {
+            let reviewed: Vec<StyledBlock> = blocks
+                .iter()
+                .filter(|block| sel.contains(block.page))
+                .cloned()
+                .collect();
+            if reviewed.is_empty() {
+                println!("Styling: no blocks on the selected pages.");
+                return Ok(());
+            }
+            run_styling_review(&reviewed, &profile)?
+        }
+        // Whole document: review the blocks in place — no clone needed.
+        None => run_styling_review(&blocks, &profile)?,
     };
-    if reviewed.is_empty() {
-        println!("Styling: no blocks on the selected pages.");
-        return Ok(());
-    }
-
-    let decisions = run_styling_review(&reviewed, &profile)?;
     let weird = decisions
         .iter()
         .filter(|decision| matches!(decision.verdict, StyleVerdict::Weird { .. }))
@@ -80,6 +81,8 @@ pub fn run(args: StyleArgs) -> Result<()> {
         decisions.len() - weird
     );
 
+    // The styling model trains locally and the review never edits the document, so the log keeps
+    // the real block text — a faithful feature, not a lossy censored copy.
     persist_styling(&args, &blocks, &profile, &decisions, &doc_id);
     Ok(())
 }
@@ -107,7 +110,7 @@ fn parse_page_selection(args: &StyleArgs, blocks: &[StyledBlock]) -> Result<Opti
     Ok(Some(selection))
 }
 
-/// Tag each styled block with its detected language (on the *original* text, before censoring).
+/// Tag each styled block with its detected language.
 fn tag_block_languages(blocks: &mut [StyledBlock], override_lang: Option<&str>) {
     let tags = {
         let texts: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
@@ -116,26 +119,6 @@ fn tag_block_languages(blocks: &mut [StyledBlock], override_lang: Option<&str>) 
     for (block, tag) in blocks.iter_mut().zip(tags) {
         block.lang = tag.lang;
         block.lang_confidence = tag.confidence;
-    }
-}
-
-/// Censor each block's text in place (deterministic "censor everything" pass) so the text shown
-/// and logged never carries real values; styling judgment needs none.
-fn censor_block_text(blocks: &mut [StyledBlock], input: &Path) {
-    let text_doc = Document {
-        source: input.to_path_buf(),
-        blocks: blocks
-            .iter()
-            .map(|block| Block::Paragraph {
-                text: block.text.clone(),
-            })
-            .collect(),
-    };
-    let censored = censor::censor(&text_doc, &CensorOptions::default()).document;
-    for (block, censored_block) in blocks.iter_mut().zip(censored.blocks) {
-        if let Block::Paragraph { text } = censored_block {
-            block.text = text;
-        }
     }
 }
 

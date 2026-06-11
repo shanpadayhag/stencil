@@ -224,10 +224,13 @@ pub struct ParaStyle {
     pub spacing: Spacing,
 }
 
-/// Run-level styling, aggregated over a block's text-bearing runs.
+/// A block's representative run styling — a compact inline summary kept for the document profile
+/// and review.
 ///
-/// The fields hold the first text-bearing run's values; [`mixed`](RunStyle::mixed) is
-/// `true` when later runs in the block disagree on any tracked property.
+/// v8 derives it from the block's dominant [`StyleSegment`] (the resolved effective run); the full
+/// per-segment detail, including the resolved-only properties (strike/caps/spacing), lives in
+/// [`StyledBlock::segments`]. Whether a block is "mixed" is [`StyledBlock::is_mixed`], not a field
+/// here.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RunStyle {
     /// The ascii font name, if set.
@@ -242,8 +245,56 @@ pub struct RunStyle {
     pub underline: Option<String>,
     /// Font color as a hex RGB string, if set.
     pub color: Option<String>,
-    /// `true` when the block's runs do not all share the same styling.
-    pub mixed: bool,
+}
+
+/// A run's *effective* styling: the values after resolving the style chain (direct formatting over
+/// the named style, its `based_on` ancestors, and document defaults).
+///
+/// Unlike [`RunStyle`] — which holds only the inline/first-run values — every field here is the
+/// resolved result. `None` means the property is genuinely unset after resolution; a block whose
+/// style chain could not be resolved at all is flagged via [`StyledBlock::style_unresolved`] rather
+/// than being silently treated as unset.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EffectiveRun {
+    /// The ascii font name.
+    pub font: Option<String>,
+    /// Font size in half-points (point size = `size_half_pt / 2`).
+    pub size_half_pt: Option<u64>,
+    /// Bold.
+    pub bold: Option<bool>,
+    /// Italic.
+    pub italic: Option<bool>,
+    /// Underline style (e.g. `single`).
+    pub underline: Option<String>,
+    /// Font color as a hex RGB string.
+    pub color: Option<String>,
+    /// Strikethrough.
+    pub strike: Option<bool>,
+    /// All-caps. (Small-caps is not modeled by docx-rs 0.4.20 — see the T45 spike.)
+    pub caps: Option<bool>,
+    /// Character spacing in twentieths of a point (negative = condensed); `None` if unset.
+    pub char_spacing: Option<i32>,
+}
+
+/// A maximal stretch of a block's text sharing one [`EffectiveRun`].
+///
+/// Adjacent runs with identical effective styling are coalesced into one segment, so a block's
+/// segments reflect *visible* style changes, not the document's internal run fragmentation.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct StyleSegment {
+    /// The segment's visible text.
+    pub text: String,
+    /// The effective run styling shared across this segment.
+    pub style: EffectiveRun,
+}
+
+/// A list's *resolved* numbering format — how the marker renders, not the opaque `num_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NumberingFormat {
+    /// The OOXML number format (e.g. `decimal`, `bullet`, `lowerLetter`, `lowerRoman`).
+    pub kind: String,
+    /// The level-text template (e.g. `%1.`), which encodes the marker punctuation and nesting.
+    pub level_text: String,
 }
 
 /// A single block's styling, captured in document order for the styling-review stage.
@@ -267,6 +318,21 @@ pub struct StyledBlock {
     pub para: ParaStyle,
     /// Run-level styling.
     pub run: RunStyle,
+    /// The block's text split into [`StyleSegment`]s, coalesced by visible style. A block with two
+    /// or more segments is "mixed" (see [`is_mixed`](StyledBlock::is_mixed)). Populated by the
+    /// extractor; empty until then.
+    #[serde(default)]
+    pub segments: Vec<StyleSegment>,
+    /// The block's resolved list-numbering format when it is a list item; `None` otherwise.
+    #[serde(default)]
+    pub numbering_format: Option<NumberingFormat>,
+    /// `true` when the paragraph's effective styling could not be resolved (missing or broken style
+    /// reference). Resolution failure is recorded as unknown, never silently as "matches".
+    #[serde(default)]
+    pub style_unresolved: bool,
+    /// `true` when the block's numbering reference could not be resolved.
+    #[serde(default)]
+    pub numbering_unresolved: bool,
     /// ISO language code detected for this block (a v7 training feature; empty until tagged).
     #[serde(default)]
     pub lang: String,
@@ -276,6 +342,43 @@ pub struct StyledBlock {
     /// 1-based page (from explicit `.docx` page breaks) for `--pages` scoping; `0` if untracked.
     #[serde(default)]
     pub page: u32,
+}
+
+impl StyledBlock {
+    /// `true` when the block has two or more styling [`segments`](StyledBlock::segments) — i.e. its
+    /// text is not uniformly styled. Because adjacent identical-styled runs are coalesced, a uniform
+    /// block has exactly one segment, so `segments.len() >= 2` is equivalent to "mixed".
+    ///
+    /// ```
+    /// use stencil::model::{EffectiveRun, StyleSegment, StyledBlock};
+    ///
+    /// let plain = StyleSegment { text: "plain ".into(), style: EffectiveRun::default() };
+    /// let bold = StyleSegment {
+    ///     text: "and bolder".into(),
+    ///     style: EffectiveRun { bold: Some(true), ..EffectiveRun::default() },
+    /// };
+    /// let block = StyledBlock { segments: vec![plain, bold], ..StyledBlock::default() };
+    /// assert!(block.is_mixed());
+    /// assert_eq!(block.dominant_segment().unwrap().text, "and bolder");
+    /// ```
+    pub fn is_mixed(&self) -> bool {
+        self.segments.len() >= 2
+    }
+
+    /// The block's representative segment — the longest by character count — used as the block's
+    /// single effective style for profile and role-norm comparison; `None` when there are no
+    /// segments. Ties resolve to the first such segment (deterministic, like the profile's norms).
+    pub fn dominant_segment(&self) -> Option<&StyleSegment> {
+        // `Reverse(index)` breaks length ties toward the smaller index, so the first longest wins
+        // (plain `max_by_key` would keep the last).
+        self.segments
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, segment)| {
+                (segment.text.chars().count(), std::cmp::Reverse(*index))
+            })
+            .map(|(_, segment)| segment)
+    }
 }
 
 /// How many blocks use a given paragraph style id (`None` = unstyled/inherited).
@@ -357,19 +460,20 @@ pub struct DocumentStyleProfile {
 
 /// A block's styling expressed relative to its [`DocumentStyleProfile`].
 ///
-/// Each field measures *deviation from the norm*, not a judgement: a block that simply
-/// inherits (unset font/size) counts as matching. These feed both the ML features and the
-/// reviewer's "vs document" panel.
+/// The match fields are tri-state: `Some(true)` matches the norm, `Some(false)` deviates, and
+/// `None` is *unknown* — the value could not be resolved (a broken style reference) or is genuinely
+/// unspecified. Unknown is never silently treated as a match (the v7 `None ⇒ matches` bug). These
+/// feed both the ML features and the reviewer's "vs document" panel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RelativeFeatures {
     /// Fraction of the document's blocks sharing this block's paragraph style (0..=1).
     pub style_doc_freq: f64,
-    /// `true` when the block inherits its font or matches the document's dominant font.
-    pub font_matches_doc_dominant: bool,
-    /// `true` when the block inherits its size or matches the document's dominant size.
-    pub size_matches_doc_dominant: bool,
-    /// `true` when the block's style signature matches its role's norm.
-    pub matches_role_peers: bool,
+    /// Whether the block's resolved font matches the document's dominant font; `None` if unknown.
+    pub font_matches_doc_dominant: Option<bool>,
+    /// Whether the block's resolved size matches the document's dominant size; `None` if unknown.
+    pub size_matches_doc_dominant: Option<bool>,
+    /// Whether the block's style signature matches its role's norm; `None` if unknown.
+    pub matches_role_peers: Option<bool>,
     /// For list items, the block's left indent minus its level's norm (twips); else `None`.
     pub indent_vs_ilvl_norm: Option<i32>,
 }
@@ -392,4 +496,39 @@ pub struct Document {
     pub source: PathBuf,
     /// The document's blocks, in order.
     pub blocks: Vec<Block>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(text: &str) -> StyleSegment {
+        StyleSegment {
+            text: text.into(),
+            style: EffectiveRun::default(),
+        }
+    }
+
+    #[test]
+    fn is_mixed_needs_at_least_two_segments() {
+        let mut block = StyledBlock::default();
+        assert!(!block.is_mixed(), "no segments is not mixed");
+        assert!(block.dominant_segment().is_none());
+
+        block.segments = vec![segment("only one")];
+        assert!(!block.is_mixed(), "a single segment is uniform");
+
+        block.segments.push(segment("second"));
+        assert!(block.is_mixed());
+    }
+
+    #[test]
+    fn dominant_segment_is_longest_then_first_on_tie() {
+        let block = StyledBlock {
+            // "bbbb" and "cccc" tie at length 4; the earlier one wins.
+            segments: vec![segment("aa"), segment("bbbb"), segment("cccc")],
+            ..StyledBlock::default()
+        };
+        assert_eq!(block.dominant_segment().unwrap().text, "bbbb");
+    }
 }

@@ -36,7 +36,10 @@ const STORE_VERSION: u32 = 1;
 const DECISION_SCHEMA: u32 = 4;
 
 /// Schema version stamped on each `styling.jsonl` record. Schema 2 (v7) adds `doc_id` + `lang`.
-const STYLING_SCHEMA: u32 = 2;
+/// Schema 3 (v8) adds the per-segment `segments` breakdown (effective styling), `numbering_format`,
+/// and the `style_unresolved`/`numbering_unresolved` flags, and drops `run.mixed` (now derivable);
+/// schema-2 lines still deserialize via `#[serde(default)]`.
+const STYLING_SCHEMA: u32 = 3;
 
 /// Max chars kept on each side of the placeholder when growing the sentence window — a
 /// safety net so a terminator-less run can't capture an unbounded span.
@@ -342,8 +345,8 @@ pub struct ParaStyle {
     pub spacing: Spacing,
 }
 
-/// Run-level styling (docx `rPr`) for the block's dominant run, with `mixed` set when runs
-/// within the block disagree.
+/// Run-level styling (docx `rPr`) for the block's representative (dominant) run. Whether the block
+/// is "mixed" is derivable from [`StylingRecord::segments`] (`len >= 2`), not stored here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunStyle {
     pub font: Option<String>,
@@ -352,7 +355,6 @@ pub struct RunStyle {
     pub italic: bool,
     pub underline: Option<String>,
     pub color: Option<String>,
-    pub mixed: bool,
 }
 
 /// Document-relative styling features — how this block deviates from the document's norms.
@@ -366,7 +368,7 @@ pub struct RelativeStyle {
     pub indent_vs_ilvl_norm: Option<f32>,
 }
 
-/// The censored text of the neighboring blocks, for peer judgment at review time.
+/// The text of the neighboring blocks, for peer judgment at review time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NeighborContext {
     pub prev_text: String,
@@ -375,7 +377,8 @@ pub struct NeighborContext {
 
 /// One row of the append-only styling log — a labeled training example for the future styling
 /// model. Every reviewed block produces one (a `fine` verdict is the negative class). The
-/// `text` stored is censored (styling judgment needs no real values). Populated by the styling
+/// `text` stored is the block's real text — the styling model trains locally, so it keeps the
+/// faithful feature rather than a lossy censored copy. Populated by the styling
 /// extraction/profile/review stages (T28–T30); defined here so the schema and its paths live
 /// alongside the censor record.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -401,15 +404,29 @@ pub struct StylingRecord {
     pub heading_level: Option<u8>,
     /// Whether the block is inside a table cell.
     pub in_table: bool,
-    /// The block's censored text.
+    /// The block's text (real, not censored).
     pub text: String,
     /// Paragraph-level styling.
     pub para: ParaStyle,
-    /// Run-level styling (dominant run + `mixed`).
+    /// Run-level styling (the representative/dominant run).
     pub run: RunStyle,
+    /// The block's styling segments — text + effective run each, coalesced by visible style
+    /// (schema 3). This is the per-segment breakdown the reviewer judged; `mixed` is
+    /// `segments.len() >= 2`.
+    #[serde(default)]
+    pub segments: Vec<crate::model::StyleSegment>,
+    /// The block's resolved numbering format, when it is a list item (schema 3).
+    #[serde(default)]
+    pub numbering_format: Option<crate::model::NumberingFormat>,
+    /// `true` when the block's effective styling could not be resolved (schema 3).
+    #[serde(default)]
+    pub style_unresolved: bool,
+    /// `true` when the block's numbering reference could not be resolved (schema 3).
+    #[serde(default)]
+    pub numbering_unresolved: bool,
     /// Document-relative deviation features.
     pub relative: RelativeStyle,
-    /// Neighboring blocks' censored text.
+    /// Neighboring blocks' text.
     pub context: NeighborContext,
     /// `fine` or `weird`.
     pub verdict: String,
@@ -787,9 +804,22 @@ mod tests {
             run: RunStyle {
                 font: Some("Arial".into()),
                 size_half_pt: Some(22),
-                mixed: true,
                 ..Default::default()
             },
+            segments: vec![crate::model::StyleSegment {
+                text: "(a) the seller shall deliver".into(),
+                style: crate::model::EffectiveRun {
+                    font: Some("Arial".into()),
+                    size_half_pt: Some(22),
+                    ..Default::default()
+                },
+            }],
+            numbering_format: Some(crate::model::NumberingFormat {
+                kind: "lowerLetter".into(),
+                level_text: "%1.".into(),
+            }),
+            style_unresolved: false,
+            numbering_unresolved: false,
             relative: RelativeStyle {
                 style_doc_freq: Some(0.5),
                 font_matches_doc_dominant: Some(false),
@@ -804,11 +834,27 @@ mod tests {
             note: Some("title as paragraph".into()),
         };
         let json = serde_json::to_string(&record).expect("serialize");
-        assert!(json.contains("\"schema\":2"));
+        assert!(json.contains("\"schema\":3"));
         assert!(json.contains("\"doc_id\":\"deadbeefcafe0001\""));
         assert!(json.contains("\"lang\":\"en\""));
         let back: StylingRecord = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, record);
+    }
+
+    #[test]
+    fn schema_2_styling_row_still_parses() {
+        // A v7 (schema 2) row lacks segments/numbering_format/*_unresolved and carries the dropped
+        // `run.mixed`; serde defaults absorb the missing fields and the unknown `mixed` is ignored.
+        let line = r#"{"schema":2,"source":"c.docx","doc_id":"id","lang":"en","lang_confidence":0.9,"block_index":1,"block_kind":"paragraph","heading_level":null,"in_table":false,"text":"x","para":{"style_name":null,"alignment":null,"indent":{},"numbering":null,"spacing":{}},"run":{"font":"Arial","size_half_pt":22,"bold":true,"italic":false,"underline":null,"color":null,"mixed":true},"relative":{},"context":{"prev_text":"","next_text":""},"verdict":"fine","category":null,"note":null}"#;
+        let record: StylingRecord = serde_json::from_str(line).expect("schema-2 row parses");
+        assert_eq!(record.schema, 2);
+        assert_eq!(record.run.font.as_deref(), Some("Arial"));
+        assert!(
+            record.segments.is_empty(),
+            "missing segments default to empty"
+        );
+        assert!(!record.style_unresolved);
+        assert_eq!(record.numbering_format, None);
     }
 
     #[test]

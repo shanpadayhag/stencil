@@ -52,6 +52,8 @@ enum Action {
     EditContext,
     /// Split a value-group into its occurrences and decide each on its own.
     Split,
+    /// Skip this value — advance without recording (kept censored by default, the unsure case).
+    Skip,
     /// Step back to re-decide the previous value.
     Back,
     /// Stop reviewing and keep the rest censored by default.
@@ -75,6 +77,7 @@ fn key_action(key: KeyEvent) -> Action {
         KeyCode::Char('n' | 'N') => Action::AddValue,
         KeyCode::Char('w' | 'W') => Action::EditContext,
         KeyCode::Char('s' | 'S') => Action::Split,
+        KeyCode::Tab => Action::Skip,
         KeyCode::Char('b' | 'B') => Action::Back,
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => Action::Quit,
         _ => Action::Ignore,
@@ -130,7 +133,7 @@ pub fn review(document: &Document, items: &[ReviewItem]) -> Result<Vec<CensorDec
     write_line(
         &mut out,
         "Review each value — [c] confirm · [t] re-type · [x] reject · [e] edit span · \
-         [n] add value · [w] edit context · [s] split · [b] back · [q] quit & save",
+         [n] add value · [w] edit context · [s] split · [tab] skip · [b] back · [q] quit & save",
     )?;
 
     let mut index = 0;
@@ -198,6 +201,12 @@ pub fn review(document: &Document, items: &[ReviewItem]) -> Result<Vec<CensorDec
                     split_done[index] = true;
                     index += 1;
                 }
+            }
+            Action::Skip => {
+                // Leave `decided[index]` as `None`: the value stays censored by default but is
+                // marked unreviewed, so nothing is logged — "skip without recording".
+                write_line(&mut out, "  → skipped (kept censored, not recorded)")?;
+                index += 1;
             }
             Action::Back => {
                 // Step back to the previous still-grouped value (skip ones already split out).
@@ -524,6 +533,7 @@ mod tests {
         assert_eq!(key_action(key(KeyCode::Char('n'))), Action::AddValue);
         assert_eq!(key_action(key(KeyCode::Char('w'))), Action::EditContext);
         assert_eq!(key_action(key(KeyCode::Char('s'))), Action::Split);
+        assert_eq!(key_action(key(KeyCode::Tab)), Action::Skip);
         assert_eq!(key_action(key(KeyCode::Char('b'))), Action::Back);
         assert_eq!(key_action(key(KeyCode::Char('q'))), Action::Quit);
         assert_eq!(key_action(key(KeyCode::Esc)), Action::Quit);

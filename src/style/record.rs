@@ -5,7 +5,7 @@
 //! This is the seam between the in-memory styling model ([`crate::model`]) and the on-disk
 //! training schema ([`crate::learn`]): it translates [`StyledBlock`] + [`RelativeFeatures`] +
 //! [`StyleVerdict`] into a flat [`StylingRecord`]. The block `text` and neighbor context are
-//! stored as-is here; censoring them is the styling stage's responsibility when it is wired up.
+//! stored as-is (real text): the styling model trains locally, so it keeps the faithful feature.
 
 use std::path::{Path, PathBuf};
 
@@ -47,6 +47,10 @@ pub fn build_record(
         text: block.text.clone(),
         para: para_style(block),
         run: run_style(block),
+        segments: block.segments.clone(),
+        numbering_format: block.numbering_format.clone(),
+        style_unresolved: block.style_unresolved,
+        numbering_unresolved: block.numbering_unresolved,
         relative: relative_style(relative),
         context,
         verdict: verdict_label.to_string(),
@@ -55,7 +59,7 @@ pub fn build_record(
     }
 }
 
-/// The censored text of the blocks immediately before and after `index`; empty at the ends.
+/// The text of the blocks immediately before and after `index`; empty at the ends.
 pub fn neighbor_context(blocks: &[StyledBlock], index: usize) -> NeighborContext {
     let text_at = |position: usize| blocks.get(position).map(|b| b.text.trim().to_string());
     NeighborContext {
@@ -159,7 +163,6 @@ fn run_style(block: &StyledBlock) -> RunStyle {
         italic: run.italic.unwrap_or(false),
         underline: run.underline.clone(),
         color: run.color.clone(),
-        mixed: run.mixed,
     }
 }
 
@@ -167,9 +170,9 @@ fn run_style(block: &StyledBlock) -> RunStyle {
 fn relative_style(relative: &RelativeFeatures) -> RelativeStyle {
     RelativeStyle {
         style_doc_freq: Some(relative.style_doc_freq as f32),
-        font_matches_doc_dominant: Some(relative.font_matches_doc_dominant),
-        size_matches_doc_dominant: Some(relative.size_matches_doc_dominant),
-        matches_role_peers: Some(relative.matches_role_peers),
+        font_matches_doc_dominant: relative.font_matches_doc_dominant,
+        size_matches_doc_dominant: relative.size_matches_doc_dominant,
+        matches_role_peers: relative.matches_role_peers,
         indent_vs_ilvl_norm: relative.indent_vs_ilvl_norm.map(|v| v as f32),
     }
 }
@@ -178,8 +181,8 @@ fn relative_style(relative: &RelativeFeatures) -> RelativeStyle {
 mod tests {
     use super::*;
     use crate::model::{
-        BlockKind, IndentTwips, Numbering as ModelNumbering, ParaStyle as ModelParaStyle,
-        RunStyle as ModelRunStyle, StyledBlock,
+        BlockKind, EffectiveRun, IndentTwips, Numbering as ModelNumbering,
+        ParaStyle as ModelParaStyle, RunStyle as ModelRunStyle, StyleSegment, StyledBlock,
     };
     use crate::style::profile::{build_profile, relative_features};
 
@@ -225,7 +228,6 @@ mod tests {
         let run = ModelRunStyle {
             bold: Some(true),
             size_half_pt: Some(28),
-            mixed: true,
             ..ModelRunStyle::default()
         };
         let para = ModelParaStyle {
@@ -241,7 +243,22 @@ mod tests {
             },
             ..ModelParaStyle::default()
         };
-        let blocks = [block(3, "Section text", para, run)];
+        // Two distinct segments → the block is mixed (the record derives `mixed` from this).
+        let mut styled = block(3, "Section text", para, run);
+        styled.segments = vec![
+            StyleSegment {
+                text: "Section ".into(),
+                style: EffectiveRun::default(),
+            },
+            StyleSegment {
+                text: "text".into(),
+                style: EffectiveRun {
+                    bold: Some(true),
+                    ..EffectiveRun::default()
+                },
+            },
+        ];
+        let blocks = [styled];
         let profile = build_profile(&blocks);
         let relative = relative_features(&blocks[0], &profile);
         let record = build_record(
@@ -261,7 +278,8 @@ mod tests {
         assert_eq!(record.note.as_deref(), Some("title as paragraph"));
         // Option flags collapsed; numbering and indent carried across.
         assert!(record.run.bold);
-        assert!(record.run.mixed);
+        // `mixed` is now derivable: the block's two segments are persisted on the record.
+        assert_eq!(record.segments.len(), 2);
         assert_eq!(record.run.size_half_pt, Some(28));
         assert_eq!(
             record.para.numbering,

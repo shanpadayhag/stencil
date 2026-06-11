@@ -62,19 +62,111 @@ pub fn build_profile(blocks: &[StyledBlock]) -> DocumentStyleProfile {
 /// };
 /// let blocks = [block(0, "Arial"), block(1, "Arial"), block(2, "Times")];
 /// let profile = build_profile(&blocks);
-/// assert!(relative_features(&blocks[0], &profile).font_matches_doc_dominant);
-/// assert!(!relative_features(&blocks[2], &profile).font_matches_doc_dominant);
+/// assert_eq!(relative_features(&blocks[0], &profile).font_matches_doc_dominant, Some(true));
+/// assert_eq!(relative_features(&blocks[2], &profile).font_matches_doc_dominant, Some(false));
 /// ```
 pub fn relative_features(block: &StyledBlock, profile: &DocumentStyleProfile) -> RelativeFeatures {
+    // A block whose style chain could not be resolved is "unknown" on every match axis — never a
+    // silent match. An unset (post-resolution) font/size is likewise unknown, not a match.
+    let known = !block.style_unresolved;
     RelativeFeatures {
         style_doc_freq: style_doc_freq(block, profile),
-        font_matches_doc_dominant: block.run.font.is_none()
-            || block.run.font == profile.dominant_font,
-        size_matches_doc_dominant: block.run.size_half_pt.is_none()
-            || block.run.size_half_pt == profile.dominant_size_half_pt,
-        matches_role_peers: matches_role_peers(block, profile),
+        font_matches_doc_dominant: (known && block.run.font.is_some())
+            .then(|| block.run.font == profile.dominant_font),
+        size_matches_doc_dominant: (known && block.run.size_half_pt.is_some())
+            .then(|| block.run.size_half_pt == profile.dominant_size_half_pt),
+        matches_role_peers: known.then(|| matches_role_peers(block, profile)),
         indent_vs_ilvl_norm: indent_vs_ilvl_norm(block, profile),
     }
+}
+
+/// Factual, non-judgmental "vs peers" notes for a block: each names a fact and the peer context with
+/// counts (e.g. `font Calibri — 3 of 4 other H2 use Arial`), never a verdict. Empty when the block
+/// agrees with its role peers on every measured axis. `blocks` is the whole document; `block` must
+/// be one of them.
+pub fn deviation_notes(
+    block: &StyledBlock,
+    blocks: &[StyledBlock],
+    _profile: &DocumentStyleProfile,
+) -> Vec<String> {
+    let role = role_key(block);
+    let label = role_label(&role);
+    let peers: Vec<&StyledBlock> = blocks
+        .iter()
+        .filter(|other| other.block_index != block.block_index && role_key(other) == role)
+        .collect();
+    let peer_count = peers.len();
+
+    let mut notes = Vec::new();
+
+    if let (Some(font), Some((common, count))) = (
+        &block.run.font,
+        majority(peers.iter().filter_map(|peer| peer.run.font.clone())),
+    ) && &common != font
+    {
+        notes.push(format!(
+            "font {font} — {count} of {peer_count} other {label} use {common}"
+        ));
+    }
+
+    if let (Some(size), Some((common, count))) = (
+        block.run.size_half_pt,
+        majority(peers.iter().filter_map(|peer| peer.run.size_half_pt)),
+    ) && common != size
+    {
+        notes.push(format!(
+            "size {}pt — {count} of {peer_count} other {label} use {}pt",
+            points(size),
+            points(common),
+        ));
+    }
+
+    if block.is_mixed() {
+        let bold = block
+            .segments
+            .iter()
+            .filter(|segment| segment.style.bold == Some(true))
+            .count();
+        notes.push(format!("{bold} of {} segments bold", block.segments.len()));
+    }
+
+    notes
+}
+
+/// A short human label for a role, used in deviation notes (`H2`, `body`, `list items`, …).
+fn role_label(role: &RoleKey) -> String {
+    match role.block_kind {
+        crate::model::BlockKind::Heading => role
+            .heading_level
+            .map(|level| format!("H{level}"))
+            .unwrap_or_else(|| "headings".to_string()),
+        crate::model::BlockKind::Paragraph => "body".to_string(),
+        crate::model::BlockKind::ListItem => "list items".to_string(),
+        crate::model::BlockKind::TableCell => "table cells".to_string(),
+    }
+}
+
+/// Point size as a compact string (`13`, `13.5`) from a half-point value.
+fn points(size_half_pt: u64) -> String {
+    format!("{}", size_half_pt as f64 / 2.0)
+}
+
+/// The most frequent item and its count, ties broken toward the smallest value; `None` if empty.
+fn majority<T: Ord>(items: impl IntoIterator<Item = T>) -> Option<(T, usize)> {
+    let mut counts: BTreeMap<T, usize> = BTreeMap::new();
+    for item in items {
+        *counts.entry(item).or_default() += 1;
+    }
+    let mut best: Option<(T, usize)> = None;
+    for (key, count) in counts {
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_count)| count > *best_count)
+        {
+            best = Some((key, count));
+        }
+    }
+    best
 }
 
 /// Fraction of the document's blocks that share this block's paragraph style.
@@ -216,7 +308,9 @@ fn mode<T: Ord>(items: impl IntoIterator<Item = T>) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BlockKind, IndentTwips, Numbering, ParaStyle, RunStyle};
+    use crate::model::{
+        BlockKind, EffectiveRun, IndentTwips, Numbering, ParaStyle, RunStyle, StyleSegment,
+    };
 
     /// A plain paragraph block carrying only the fields a test cares about.
     fn block(index: usize, para: ParaStyle, run: RunStyle) -> StyledBlock {
@@ -280,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn dominant_font_and_size_ignore_inherited() {
+    fn unset_font_and_size_are_unknown_not_a_match() {
         let sized = |pt| RunStyle {
             font: Some("Arial".into()),
             size_half_pt: Some(pt),
@@ -289,7 +383,7 @@ mod tests {
         let blocks = [
             block(0, ParaStyle::default(), sized(24)),
             block(1, ParaStyle::default(), sized(24)),
-            block(2, ParaStyle::default(), RunStyle::default()), // inherits both
+            block(2, ParaStyle::default(), RunStyle::default()), // unset font/size
             block(3, ParaStyle::default(), font("Times")),
         ];
         let profile = build_profile(&blocks);
@@ -297,12 +391,30 @@ mod tests {
         assert_eq!(profile.dominant_font.as_deref(), Some("Arial"));
         assert_eq!(profile.dominant_size_half_pt, Some(24));
 
-        // Inheriting block counts as matching (no deviation).
-        let inherited = relative_features(&blocks[2], &profile);
-        assert!(inherited.font_matches_doc_dominant);
-        assert!(inherited.size_matches_doc_dominant);
-        // Explicit odd-one-out font deviates.
-        assert!(!relative_features(&blocks[3], &profile).font_matches_doc_dominant);
+        // An unset (post-resolution) font/size is *unknown* — not silently a match (the v7 bug).
+        let unset = relative_features(&blocks[2], &profile);
+        assert_eq!(unset.font_matches_doc_dominant, None);
+        assert_eq!(unset.size_matches_doc_dominant, None);
+        // A resolved matching font matches; a resolved different font deviates.
+        assert_eq!(
+            relative_features(&blocks[0], &profile).font_matches_doc_dominant,
+            Some(true)
+        );
+        assert_eq!(
+            relative_features(&blocks[3], &profile).font_matches_doc_dominant,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn unresolved_block_is_unknown_on_every_axis() {
+        let mut block = block(0, ParaStyle::default(), font("Arial"));
+        block.style_unresolved = true;
+        let blocks = [block];
+        let profile = build_profile(&blocks);
+        let relative = relative_features(&blocks[0], &profile);
+        assert_eq!(relative.font_matches_doc_dominant, None);
+        assert_eq!(relative.matches_role_peers, None);
     }
 
     #[test]
@@ -318,9 +430,18 @@ mod tests {
         ];
         let profile = build_profile(&blocks);
 
-        assert!(relative_features(&blocks[0], &profile).matches_role_peers);
-        assert!(relative_features(&blocks[1], &profile).matches_role_peers);
-        assert!(!relative_features(&blocks[2], &profile).matches_role_peers);
+        assert_eq!(
+            relative_features(&blocks[0], &profile).matches_role_peers,
+            Some(true)
+        );
+        assert_eq!(
+            relative_features(&blocks[1], &profile).matches_role_peers,
+            Some(true)
+        );
+        assert_eq!(
+            relative_features(&blocks[2], &profile).matches_role_peers,
+            Some(false)
+        );
     }
 
     #[test]
@@ -344,8 +465,14 @@ mod tests {
         let profile = build_profile(&blocks);
 
         assert_eq!(profile.role_norms.len(), 2);
-        assert!(relative_features(&blocks[0], &profile).matches_role_peers);
-        assert!(relative_features(&blocks[2], &profile).matches_role_peers);
+        assert_eq!(
+            relative_features(&blocks[0], &profile).matches_role_peers,
+            Some(true)
+        );
+        assert_eq!(
+            relative_features(&blocks[2], &profile).matches_role_peers,
+            Some(true)
+        );
     }
 
     #[test]
@@ -396,5 +523,57 @@ mod tests {
         assert_eq!(mode([20, 10]), Some(10));
         assert_eq!(mode([20, 10, 10]), Some(10));
         assert_eq!(mode::<i32>([]), None);
+    }
+
+    #[test]
+    fn deviation_notes_flag_off_font_against_role_peers() {
+        let heading = |index, font_name: &str| StyledBlock {
+            block_index: index,
+            block_kind: BlockKind::Heading,
+            heading_level: Some(2),
+            ..block(index, ParaStyle::default(), font(font_name))
+        };
+        let blocks = [
+            heading(0, "Arial"),
+            heading(1, "Arial"),
+            heading(2, "Arial"),
+            heading(3, "Calibri"), // the odd one out
+        ];
+        let profile = build_profile(&blocks);
+
+        let notes = deviation_notes(&blocks[3], &blocks, &profile);
+        assert!(
+            notes.iter().any(|note| note.contains("font Calibri")
+                && note.contains("use Arial")
+                && note.contains("H2")),
+            "expected an off-font note vs H2 peers, got: {notes:?}"
+        );
+        // A peer that matches the majority font gets no note.
+        assert!(deviation_notes(&blocks[0], &blocks, &profile).is_empty());
+    }
+
+    #[test]
+    fn deviation_notes_summarize_mixed_segments() {
+        let mut mixed = block(0, ParaStyle::default(), RunStyle::default());
+        mixed.segments = vec![
+            StyleSegment {
+                text: "plain ".into(),
+                style: EffectiveRun::default(),
+            },
+            StyleSegment {
+                text: "bold".into(),
+                style: EffectiveRun {
+                    bold: Some(true),
+                    ..EffectiveRun::default()
+                },
+            },
+        ];
+        let blocks = [mixed];
+        let profile = build_profile(&blocks);
+        let notes = deviation_notes(&blocks[0], &blocks, &profile);
+        assert!(
+            notes.iter().any(|note| note.contains("segments bold")),
+            "expected a mixed-segments note, got: {notes:?}"
+        );
     }
 }

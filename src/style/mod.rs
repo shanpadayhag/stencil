@@ -8,8 +8,10 @@
 //! - [`profile`] — descriptive document style profile + per-block relative features (T29).
 //! - [`review`] — interactive two-step per-block verdict loop (T30).
 //! - [`record`] — assemble and persist [`crate::learn::StylingRecord`]s + profile sidecar (T30).
+//! - [`resolve`] — resolve a block's *effective* styling through the style + numbering tables (T47).
 
 pub mod extract;
 pub mod profile;
 pub mod record;
+pub mod resolve;
 pub mod review;

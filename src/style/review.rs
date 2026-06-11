@@ -2,8 +2,9 @@
 //! two-step keypress — `space` = fine (the cheap default), `w` = weird → pick a category
 //! (`f`/`r`/`i`/`b`/`o`) and an optional note, `b` back, `q`/`esc` quit & save.
 //!
-//! There is no detector here: the screen shows the block's text, its styling, and a "vs
-//! document" panel derived from the [`DocumentStyleProfile`], and the reviewer supplies every
+//! There is no detector here: the screen shows the block's text, its *effective* styling — a
+//! per-segment breakdown when the block is mixed, else a single style line — and factual
+//! "vs peers" notes derived from the [`DocumentStyleProfile`]; the reviewer supplies every
 //! verdict. Every block the reviewer reaches is recorded (a `fine` verdict is the negative
 //! class). The terminal I/O lives here; the decision rules ([`key_action`], [`category_for_key`])
 //! are pure functions, unit-tested without a TTY.
@@ -14,8 +15,8 @@ use anyhow::{Result, bail};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, read};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
-use crate::model::{DocumentStyleProfile, RelativeFeatures, StyledBlock};
-use crate::style::profile::relative_features;
+use crate::model::{DocumentStyleProfile, EffectiveRun, StyledBlock};
+use crate::style::profile::deviation_notes;
 
 /// The weird-category menu: a key per category the reviewer can assign.
 const CATEGORY_MENU: &[(char, &str)] = &[
@@ -56,6 +57,8 @@ enum Action {
     Fine,
     /// Flag the block as weird (opens the category menu next).
     Weird,
+    /// Skip the block — advance without recording any verdict (the unsure case).
+    Skip,
     /// Step back to re-decide the previous block.
     Back,
     /// Stop reviewing and save what was decided.
@@ -74,6 +77,7 @@ fn key_action(key: KeyEvent) -> Action {
     match key.code {
         KeyCode::Char(' ') => Action::Fine,
         KeyCode::Char('w' | 'W') => Action::Weird,
+        KeyCode::Tab => Action::Skip,
         KeyCode::Char('b' | 'B') => Action::Back,
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => Action::Quit,
         _ => Action::Ignore,
@@ -113,14 +117,14 @@ pub fn review(
 
     write_line(
         &mut out,
-        "Review each block — [space] fine · [w] weird · [b] back · [q] quit & save",
+        "Review each block — [space] fine · [w] weird · [tab] skip · [b] back · [q] quit & save",
     )?;
 
     let mut index = 0;
     while index < total {
         let block = &blocks[index];
-        let relative = relative_features(block, profile);
-        prompt(&mut out, index + 1, total, block, &relative)?;
+        let notes = deviation_notes(block, blocks, profile);
+        prompt(&mut out, index + 1, total, block, &notes)?;
         match read_action()? {
             Action::Fine => {
                 decided[index] = Some(StyleVerdict::Fine);
@@ -139,6 +143,11 @@ pub fn review(
                 }
                 None => write_line(&mut out, "  (weird cancelled)")?,
             },
+            Action::Skip => {
+                // Leave `decided[index]` as `None`; it is filtered out, so nothing is recorded.
+                write_line(&mut out, "  → skipped (not recorded)")?;
+                index += 1;
+            }
             Action::Back => {
                 if index > 0 {
                     index -= 1;
@@ -249,14 +258,14 @@ fn read_note(out: &mut impl Write) -> Result<Option<String>> {
     Ok((!note.is_empty()).then(|| note.to_string()))
 }
 
-/// Print the prompt for one block: its position, kind, a text preview, the inline styling, and
-/// the "vs document" deviation panel.
+/// Print the prompt for one block: its position, kind, a text preview, its effective styling (a
+/// per-segment breakdown when mixed, else a single style line), and the factual "vs peers" notes.
 fn prompt(
     out: &mut impl Write,
     index: usize,
     total: usize,
     block: &StyledBlock,
-    relative: &RelativeFeatures,
+    notes: &[String],
 ) -> Result<()> {
     write_line(out, "")?;
     write_line(
@@ -271,14 +280,16 @@ fn prompt(
         ),
     )?;
     write_line(out, &format!("   text: {}", preview(&block.text)))?;
-    write_line(out, &format!("   style: {}", inline_style(block)))?;
-    for line in deviations(relative) {
-        write_line(out, &format!("   vs doc: {line}"))?;
+    for line in style_lines(block) {
+        write_line(out, &line)?;
+    }
+    for note in notes {
+        write_line(out, &format!("   vs peers: {note}"))?;
     }
     Ok(())
 }
 
-/// A single-line, length-capped preview of a block's text.
+/// A single-line, length-capped preview of text.
 fn preview(text: &str) -> String {
     const MAX: usize = 100;
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -290,57 +301,68 @@ fn preview(text: &str) -> String {
     }
 }
 
-/// A compact, human-readable summary of a block's inline styling.
-fn inline_style(block: &StyledBlock) -> String {
-    let mut parts = Vec::new();
-    if let Some(style) = &block.para.style_name {
-        parts.push(style.clone());
+/// The styling display lines for a block: a `segments:` bullet list when the block has ≥2 distinct
+/// segments, otherwise a single `style:` line. An unresolved block reads "unknown".
+fn style_lines(block: &StyledBlock) -> Vec<String> {
+    if block.style_unresolved {
+        return vec!["   style: unknown (could not resolve the style)".to_string()];
     }
-    if let Some(font) = &block.run.font {
+    if block.is_mixed() {
+        let mut lines = vec!["   segments:".to_string()];
+        for segment in &block.segments {
+            lines.push(format!(
+                "     • \"{}\" — {}",
+                preview(&segment.text),
+                effective_summary(&segment.style),
+            ));
+        }
+        lines
+    } else {
+        let summary = block
+            .segments
+            .first()
+            .map(|segment| effective_summary(&segment.style))
+            .unwrap_or_else(|| "(inherited)".to_string());
+        let line = match block.para.style_name.as_deref() {
+            Some(name) => format!("   style: {name} → {summary}"),
+            None => format!("   style: {summary}"),
+        };
+        vec![line]
+    }
+}
+
+/// A compact, human-readable summary of a resolved run's styling; "(inherited)" when nothing is set.
+fn effective_summary(run: &EffectiveRun) -> String {
+    let mut parts = Vec::new();
+    if let Some(font) = &run.font {
         parts.push(font.clone());
     }
-    if let Some(size) = block.run.size_half_pt {
+    if let Some(size) = run.size_half_pt {
         parts.push(format!("{}pt", size as f64 / 2.0));
     }
-    if block.run.bold == Some(true) {
+    if run.bold == Some(true) {
         parts.push("bold".to_string());
     }
-    if block.run.italic == Some(true) {
+    if run.italic == Some(true) {
         parts.push("italic".to_string());
     }
-    if block.run.mixed {
-        parts.push("mixed-runs".to_string());
+    if run.underline.is_some() {
+        parts.push("underline".to_string());
+    }
+    if run.strike == Some(true) {
+        parts.push("strike".to_string());
+    }
+    if run.caps == Some(true) {
+        parts.push("caps".to_string());
+    }
+    if let Some(spacing) = run.char_spacing.filter(|value| *value != 0) {
+        parts.push(format!("spacing {spacing:+}"));
     }
     if parts.is_empty() {
         "(inherited)".to_string()
     } else {
         parts.join(", ")
     }
-}
-
-/// The "vs document" deviation lines, one per feature that departs from the norm. An empty
-/// result means the block matches the document on every measured axis.
-fn deviations(relative: &RelativeFeatures) -> Vec<String> {
-    let mut lines = Vec::new();
-    if !relative.font_matches_doc_dominant {
-        lines.push("font differs from the document's dominant font".to_string());
-    }
-    if !relative.size_matches_doc_dominant {
-        lines.push("size differs from the document's dominant size".to_string());
-    }
-    if !relative.matches_role_peers {
-        lines.push("styling differs from same-role blocks".to_string());
-    }
-    if let Some(delta) = relative.indent_vs_ilvl_norm
-        && delta != 0
-    {
-        lines.push(format!("indent {delta:+} twips vs this list level's norm"));
-    }
-    lines.push(format!(
-        "style used by {:.0}% of blocks",
-        relative.style_doc_freq * 100.0
-    ));
-    lines
 }
 
 /// Write a single line followed by a CR+LF (raw mode does not translate `\n`).
@@ -362,7 +384,14 @@ impl Drop for RawModeGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BlockKind, ParaStyle, RunStyle};
+    use crate::model::{BlockKind, ParaStyle, StyleSegment};
+
+    fn segment(text: &str, style: EffectiveRun) -> StyleSegment {
+        StyleSegment {
+            text: text.into(),
+            style,
+        }
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -372,6 +401,7 @@ mod tests {
     fn keys_map_to_actions() {
         assert_eq!(key_action(key(KeyCode::Char(' '))), Action::Fine);
         assert_eq!(key_action(key(KeyCode::Char('w'))), Action::Weird);
+        assert_eq!(key_action(key(KeyCode::Tab)), Action::Skip);
         assert_eq!(key_action(key(KeyCode::Char('b'))), Action::Back);
         assert_eq!(key_action(key(KeyCode::Char('q'))), Action::Quit);
         assert_eq!(key_action(key(KeyCode::Esc)), Action::Quit);
@@ -413,34 +443,78 @@ mod tests {
     }
 
     #[test]
-    fn deviations_list_each_departure_and_always_report_freq() {
-        let relative = RelativeFeatures {
-            style_doc_freq: 0.25,
-            font_matches_doc_dominant: false,
-            size_matches_doc_dominant: true,
-            matches_role_peers: false,
-            indent_vs_ilvl_norm: Some(360),
+    fn effective_summary_lists_set_properties_else_inherited() {
+        assert_eq!(effective_summary(&EffectiveRun::default()), "(inherited)");
+        let run = EffectiveRun {
+            font: Some("Arial".into()),
+            size_half_pt: Some(26),
+            bold: Some(true),
+            strike: Some(true),
+            char_spacing: Some(-3),
+            ..EffectiveRun::default()
         };
-        let lines = deviations(&relative);
-        assert!(lines.iter().any(|line| line.contains("font differs")));
-        assert!(lines.iter().any(|line| line.contains("same-role")));
-        assert!(lines.iter().any(|line| line.contains("+360")));
-        assert!(!lines.iter().any(|line| line.contains("size differs")));
-        assert!(lines.iter().any(|line| line.contains("25%")));
+        assert_eq!(
+            effective_summary(&run),
+            "Arial, 13pt, bold, strike, spacing -3"
+        );
     }
 
     #[test]
-    fn inline_style_falls_back_to_inherited() {
+    fn uniform_block_shows_one_style_line_with_its_style_name() {
         let block = StyledBlock {
-            block_index: 0,
-            block_kind: BlockKind::Paragraph,
-            heading_level: None,
-            in_table: false,
-            text: "x".into(),
-            para: ParaStyle::default(),
-            run: RunStyle::default(),
+            block_kind: BlockKind::Heading,
+            heading_level: Some(2),
+            para: ParaStyle {
+                style_name: Some("Heading2".into()),
+                ..ParaStyle::default()
+            },
+            segments: vec![segment(
+                "Payment Terms",
+                EffectiveRun {
+                    font: Some("Arial".into()),
+                    size_half_pt: Some(26),
+                    bold: Some(true),
+                    ..EffectiveRun::default()
+                },
+            )],
             ..Default::default()
         };
-        assert_eq!(inline_style(&block), "(inherited)");
+        let lines = style_lines(&block);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "   style: Heading2 → Arial, 13pt, bold");
+    }
+
+    #[test]
+    fn mixed_block_shows_a_segment_bullet_list() {
+        let block = StyledBlock {
+            segments: vec![
+                segment("Plain ", EffectiveRun::default()),
+                segment(
+                    "bold",
+                    EffectiveRun {
+                        bold: Some(true),
+                        ..EffectiveRun::default()
+                    },
+                ),
+            ],
+            ..Default::default()
+        };
+        let lines = style_lines(&block);
+        assert_eq!(lines[0], "   segments:");
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].contains("\"Plain\"") && lines[1].contains("(inherited)"));
+        assert!(lines[2].contains("\"bold\"") && lines[2].contains("bold"));
+    }
+
+    #[test]
+    fn unresolved_block_reads_unknown() {
+        let block = StyledBlock {
+            style_unresolved: true,
+            segments: vec![segment("x", EffectiveRun::default())],
+            ..Default::default()
+        };
+        let lines = style_lines(&block);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("unknown"));
     }
 }
