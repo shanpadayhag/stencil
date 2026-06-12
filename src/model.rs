@@ -126,6 +126,41 @@ impl BlockKind {
     }
 }
 
+/// The neighboring text around a value's occurrence — surfaced in the censor review and logged as a
+/// training feature (v10).
+///
+/// For a flow block (paragraph/heading), `above`/`below` are the adjacent blocks and the
+/// header/label fields are `None`. For a table cell, `above`/`below` are the cells one row up/down in
+/// the same column, `col_header` is row 0 of the column, and `row_label` is column 0 of the row.
+///
+/// `None` means there is no such neighbor (document edge, not a table, or the neighbor *is* the cell
+/// itself); `Some("")` is a present-but-empty neighbor.
+///
+/// ```
+/// use stencil::model::CensorNeighbors;
+///
+/// let n = CensorNeighbors { above: Some("123 Main Street".into()), ..Default::default() };
+/// assert_eq!(n.above.as_deref(), Some("123 Main Street"));
+/// assert_eq!(n.below, None);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CensorNeighbors {
+    /// The neighbor above — flow: the previous block; table: the cell one row up in this column.
+    #[serde(default)]
+    pub above: Option<String>,
+    /// The neighbor below — flow: the next block; table: the cell one row down in this column.
+    #[serde(default)]
+    pub below: Option<String>,
+    /// Table only: the column header (row 0 of this cell's column); `None` for a flow block or a
+    /// cell already in row 0.
+    #[serde(default)]
+    pub col_header: Option<String>,
+    /// Table only: the row label (column 0 of this cell's row); `None` for a flow block or a cell
+    /// already in column 0.
+    #[serde(default)]
+    pub row_label: Option<String>,
+}
+
 /// One location of a detected value within a document, with the review context captured at
 /// that spot.
 ///
@@ -172,6 +207,8 @@ pub struct Occurrence {
     pub lang: String,
     /// Language-detection confidence in 0..=1 (`0.0` for a fallback/untagged occurrence).
     pub lang_confidence: f32,
+    /// The neighbor context around this occurrence (v10): review context + training feature.
+    pub neighbors: CensorNeighbors,
 }
 
 /// Paragraph indentation, in twips (1/1440 inch); `None` where the property is unset.

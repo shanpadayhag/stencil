@@ -17,7 +17,8 @@ use crate::learn::{
     DecisionRecord, LearnedStore, block_window_at, decision_schema, sentence_window_at,
 };
 use crate::model::{
-    Block, BlockKind, Cell, Document, MAPPING_VERSION, Mapping, MappingEntry, Occurrence,
+    Block, BlockKind, Cell, CensorNeighbors, Document, MAPPING_VERSION, Mapping, MappingEntry,
+    Occurrence,
 };
 
 pub use names::PartyList;
@@ -380,6 +381,14 @@ impl ReviewItem {
             .first()
             .map_or("", |o| o.block_context.as_str())
     }
+
+    /// The first occurrence's neighbor context — what a whole-group decision records (v10).
+    pub fn first_neighbors(&self) -> CensorNeighbors {
+        self.occurrences
+            .first()
+            .map(|o| o.neighbors.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// The reviewer's verdict for a value.
@@ -440,6 +449,9 @@ pub struct CensorDecision {
     pub context_edited: bool,
     /// The reviewer added this value; the detector did not flag it.
     pub user_added: bool,
+    /// The neighbor context around the decided value (v10): for a group, the first occurrence's;
+    /// for a split occurrence, that occurrence's.
+    pub neighbors: CensorNeighbors,
 }
 
 impl CensorDecision {
@@ -464,6 +476,7 @@ impl CensorDecision {
             span_edited: false,
             context_edited: false,
             user_added: false,
+            neighbors: item.first_neighbors(),
         }
     }
 
@@ -483,6 +496,7 @@ impl CensorDecision {
         } else {
             vec![occurrence.lang.clone()]
         };
+        let neighbors = occurrence.neighbors.clone();
         Self {
             value: value.to_string(),
             detected_type,
@@ -498,6 +512,7 @@ impl CensorDecision {
             span_edited: false,
             context_edited: false,
             user_added: false,
+            neighbors,
         }
     }
 
@@ -585,6 +600,54 @@ fn document_fields(document: &Document) -> Vec<FieldRef<'_>> {
     fields
 }
 
+/// Resolve the [`CensorNeighbors`] around a field located by `(block_index, cell)` (v10).
+///
+/// A flow block (`cell == None`) takes the previous/next block's text as `above`/`below` — an
+/// adjacent table neighbor is omitted, and the header/label fields stay `None`. A table cell takes
+/// the cells one row up/down in its column, the column header (row 0), and the row label (column 0),
+/// dropping any header/label that resolves to the cell itself.
+fn neighbors_at(
+    document: &Document,
+    block_index: usize,
+    cell: Option<(usize, usize)>,
+) -> CensorNeighbors {
+    match cell {
+        None => CensorNeighbors {
+            above: block_index
+                .checked_sub(1)
+                .and_then(|index| flow_text(document.blocks.get(index))),
+            below: flow_text(document.blocks.get(block_index + 1)),
+            ..Default::default()
+        },
+        Some((row, col)) => {
+            let Some(Block::Table { rows }) = document.blocks.get(block_index) else {
+                return CensorNeighbors::default();
+            };
+            let cell_text = |r: usize, c: usize| {
+                rows.get(r)
+                    .and_then(|cells| cells.get(c))
+                    .map(|cell| cell.text.clone())
+            };
+            CensorNeighbors {
+                above: row.checked_sub(1).and_then(|r| cell_text(r, col)),
+                below: cell_text(row + 1, col),
+                // A cell already in row 0 / column 0 is its own header / label → keep it `None`.
+                col_header: (row != 0).then(|| cell_text(0, col)).flatten(),
+                row_label: (col != 0).then(|| cell_text(row, 0)).flatten(),
+            }
+        }
+    }
+}
+
+/// The text of a flow block (heading/paragraph) used as a neighbor; `None` for an absent block or a
+/// table (an adjacent table neighbor is omitted in v10).
+fn flow_text(block: Option<&Block>) -> Option<String> {
+    match block {
+        Some(Block::Heading { text, .. } | Block::Paragraph { text }) => Some(text.clone()),
+        _ => None,
+    }
+}
+
 /// Plan the review: detect across the whole document, resolve overlaps per field, drop
 /// allow-listed values, and return one [`ReviewItem`] per distinct value in first-seen order.
 /// Each item carries every [`Occurrence`] of its value, with that occurrence's location, block
@@ -605,6 +668,7 @@ pub fn plan_review(document: &Document, options: &CensorOptions<'_>) -> Vec<Revi
                 heading_level: field.heading_level,
                 shown_context: sentence_window_at(field.text, candidate.start, candidate.end),
                 block_context: block_window_at(field.text, candidate.start, candidate.end),
+                neighbors: neighbors_at(document, field.block_index, field.cell),
                 ..Default::default() // lang tagged in a later pass (see `tag_occurrence_languages`)
             };
             if let Some(item) = items.get_mut(&value) {
@@ -685,6 +749,7 @@ pub(crate) fn locate_value(
                 heading_level: field.heading_level,
                 shown_context: sentence_window_at(field.text, start, end),
                 block_context: block_window_at(field.text, start, end),
+                neighbors: neighbors_at(document, field.block_index, field.cell),
                 ..Default::default()
             });
         }
@@ -979,6 +1044,7 @@ pub fn decision_records(
                 span_edited: decision.span_edited,
                 context_edited: decision.context_edited,
                 user_added: decision.user_added,
+                neighbors: decision.neighbors.clone(),
             }
         })
         .collect()
@@ -1713,5 +1779,122 @@ mod tests {
             &[confirm_dec("Maybe", ValueType::Entity, "ENTITY")],
         );
         assert!(!store.allowed_values().contains("Maybe"));
+    }
+
+    // ── Neighbor context (v10) ──────────────────────────────────────────────────
+
+    #[test]
+    fn neighbors_at_flow_blocks_take_prev_and_next() {
+        let doc = Document {
+            source: PathBuf::from("c.txt"),
+            blocks: vec![
+                Block::Paragraph {
+                    text: "123 Main Street".into(),
+                },
+                Block::Paragraph {
+                    text: "Springfield, IL 62704".into(),
+                },
+                Block::Paragraph { text: "USA".into() },
+            ],
+        };
+        let middle = neighbors_at(&doc, 1, None);
+        assert_eq!(middle.above.as_deref(), Some("123 Main Street"));
+        assert_eq!(middle.below.as_deref(), Some("USA"));
+        assert_eq!(middle.col_header, None, "flow blocks have no header");
+        assert_eq!(middle.row_label, None, "flow blocks have no row label");
+        // Document edges: first has no above, last has no below.
+        assert_eq!(neighbors_at(&doc, 0, None).above, None);
+        assert_eq!(neighbors_at(&doc, 2, None).below, None);
+    }
+
+    #[test]
+    fn neighbors_at_flow_omits_an_adjacent_table() {
+        let doc = Document {
+            source: PathBuf::from("c.docx"),
+            blocks: vec![
+                Block::Table {
+                    rows: vec![vec![Cell::new("x")]],
+                },
+                Block::Paragraph {
+                    text: "after".into(),
+                },
+            ],
+        };
+        // The paragraph's previous block is a table → omitted, not flattened into text.
+        assert_eq!(neighbors_at(&doc, 1, None).above, None);
+    }
+
+    #[test]
+    fn neighbors_at_table_cell_takes_grid_and_headers() {
+        // (Address | Buyer)      row 0  ← headers
+        // (123 Main St | Acme)   row 1
+        // (Springfield | Wonka)  row 2
+        let doc = Document {
+            source: PathBuf::from("c.docx"),
+            blocks: vec![Block::Table {
+                rows: vec![
+                    vec![Cell::new("Address"), Cell::new("Buyer")],
+                    vec![Cell::new("123 Main St"), Cell::new("Acme")],
+                    vec![Cell::new("Springfield"), Cell::new("Wonka")],
+                ],
+            }],
+        };
+        // Cell (1,0) = "123 Main St": up/down in its column, header from row 0, self is column 0.
+        let mid = neighbors_at(&doc, 0, Some((1, 0)));
+        assert_eq!(mid.above.as_deref(), Some("Address"));
+        assert_eq!(mid.below.as_deref(), Some("Springfield"));
+        assert_eq!(mid.col_header.as_deref(), Some("Address"));
+        assert_eq!(mid.row_label, None, "cell is itself in column 0");
+        // Cell (2,1) = "Wonka": header + row label present, no row below.
+        let corner = neighbors_at(&doc, 0, Some((2, 1)));
+        assert_eq!(corner.above.as_deref(), Some("Acme"));
+        assert_eq!(corner.below, None);
+        assert_eq!(corner.col_header.as_deref(), Some("Buyer"));
+        assert_eq!(corner.row_label.as_deref(), Some("Springfield"));
+    }
+
+    #[test]
+    fn neighbors_at_header_cell_is_its_own_header_and_label() {
+        let doc = Document {
+            source: PathBuf::from("c.docx"),
+            blocks: vec![Block::Table {
+                rows: vec![vec![Cell::new("Address"), Cell::new("Buyer")]],
+            }],
+        };
+        // Row 0 / column 0: its own header and label → both None; single-row table → no below.
+        let n = neighbors_at(&doc, 0, Some((0, 0)));
+        assert_eq!(n.col_header, None);
+        assert_eq!(n.row_label, None);
+        assert_eq!(n.above, None);
+        assert_eq!(n.below, None);
+    }
+
+    #[test]
+    fn plan_review_records_occurrence_neighbors() {
+        let doc = Document {
+            source: PathBuf::from("c.txt"),
+            blocks: vec![
+                Block::Paragraph {
+                    text: "123 Main Street".into(),
+                },
+                Block::Paragraph {
+                    text: "Email a@b.com here".into(),
+                },
+                Block::Paragraph {
+                    text: "Trailing line".into(),
+                },
+            ],
+        };
+        let items = plan_review(&doc, &CensorOptions::default());
+        let email = items
+            .iter()
+            .find(|item| item.value == "a@b.com")
+            .expect("email detected");
+        let neighbors = &email.occurrences[0].neighbors;
+        assert_eq!(neighbors.above.as_deref(), Some("123 Main Street"));
+        assert_eq!(neighbors.below.as_deref(), Some("Trailing line"));
+        // A whole-group decision carries the first occurrence's neighbors.
+        let decision = CensorDecision::from_item(email, Verdict::Reject, true);
+        assert_eq!(decision.neighbors.above.as_deref(), Some("123 Main Street"));
     }
 }

@@ -25,6 +25,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::model::CensorNeighbors;
+
 /// Current on-disk schema version for `learned.json`.
 const STORE_VERSION: u32 = 1;
 
@@ -32,8 +34,9 @@ const STORE_VERSION: u32 = 1;
 /// now keyed on the reviewed value with `method`/`detected_type`/`verdict`/`final_type` (the
 /// multi-class label), replacing the schema-2 `placeholder`/`type`/`decision` fields. Schema 4
 /// (v7) adds `doc_id`, per-occurrence `block_kinds`/`heading_level`/`langs`, the decision scope,
-/// and edit provenance; schema-2/3 lines still deserialize via `#[serde(default)]`.
-const DECISION_SCHEMA: u32 = 4;
+/// and edit provenance. Schema 5 (v10) adds the `neighbors` context. Older lines still
+/// deserialize via `#[serde(default)]`.
+const DECISION_SCHEMA: u32 = 5;
 
 /// Schema version stamped on each `styling.jsonl` record. Schema 2 (v7) adds `doc_id` + `lang`.
 /// Schema 3 (v8) adds the per-segment `segments` breakdown (effective styling), `numbering_format`,
@@ -300,6 +303,10 @@ pub struct DecisionRecord {
     /// The reviewer added this value; the detector did not flag it (schema 4).
     #[serde(default)]
     pub user_added: bool,
+    /// The neighbor context around the value (schema 5): the review aid + training feature. For a
+    /// group, the first occurrence's; for a split occurrence, that occurrence's.
+    #[serde(default)]
+    pub neighbors: CensorNeighbors,
 }
 
 /// The current decision-record schema version stamped on freshly written rows.
@@ -712,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn decision_record_round_trips_with_schema_4_fields() {
+    fn decision_record_round_trips_with_schema_5_fields() {
         let record = DecisionRecord {
             schema: decision_schema(),
             timestamp: 1,
@@ -731,10 +738,15 @@ mod tests {
             heading_level: None,
             langs: vec!["en".into()],
             span_edited: true,
+            neighbors: CensorNeighbors {
+                above: Some("123 Main Street".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let json = serde_json::to_string(&record).expect("serialize");
-        assert!(json.contains("\"schema\":4"));
+        assert!(json.contains("\"schema\":5"));
+        assert!(json.contains("\"neighbors\":{\"above\":\"123 Main Street\""));
         assert!(json.contains("\"doc_id\":\"deadbeefcafe0001\""));
         assert!(json.contains("\"scope\":\"group\""));
         assert!(json.contains("\"block_kinds\":[\"heading\",\"paragraph\"]"));
@@ -792,6 +804,43 @@ mod tests {
         assert_eq!(rec.schema, 2);
         assert_eq!(rec.method, "", "new fields fall back to defaults");
         assert_eq!(rec.final_type, None);
+    }
+
+    #[test]
+    fn schema_4_decision_line_parses_without_neighbors() {
+        // A v7 schema-4 line predates the v10 `neighbors` field; it must still deserialize, with
+        // neighbors defaulting to all-`None`.
+        let schema4 = r#"{"schema":4,"timestamp":7,"source":"c.txt","value":"Jane","method":"heuristic","detected_type":"ENTITY","verdict":"reject","shown_context":"x","block_context":"y","occurrences":1,"doc_id":"docid","scope":"group","block_kinds":["paragraph"],"langs":[]}"#;
+        let rec: DecisionRecord = serde_json::from_str(schema4).expect("schema-4 still parses");
+        assert_eq!(rec.value, "Jane");
+        assert_eq!(rec.schema, 4);
+        assert_eq!(
+            rec.neighbors,
+            CensorNeighbors::default(),
+            "neighbors default to all-None"
+        );
+        assert_eq!(decision_schema(), 5, "fresh records stamp schema 5");
+    }
+
+    #[test]
+    fn decision_record_round_trips_neighbors() {
+        let rec = DecisionRecord {
+            schema: decision_schema(),
+            neighbors: CensorNeighbors {
+                above: Some("123 Main Street".into()),
+                col_header: Some("Mailing Address".into()),
+                ..Default::default()
+            },
+            ..DecisionRecord::default()
+        };
+        let json = serde_json::to_string(&rec).expect("serialize");
+        let back: DecisionRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.neighbors.above.as_deref(), Some("123 Main Street"));
+        assert_eq!(
+            back.neighbors.col_header.as_deref(),
+            Some("Mailing Address")
+        );
+        assert_eq!(back.neighbors.below, None);
     }
 
     #[test]

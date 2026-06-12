@@ -16,7 +16,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, rea
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use super::{CensorDecision, ReviewItem, ValueType, Verdict, edit, locate_value};
-use crate::model::Document;
+use crate::model::{CensorNeighbors, Document};
 
 /// The re-type menu: a key per final type the reviewer can assign. `ID` is coarse (the precise
 /// subtype stays in the record's `method`); `other` is the long-tail escape hatch.
@@ -411,6 +411,9 @@ fn prompt_occurrence(
     if !occurrence.shown_context.is_empty() {
         write_line(out, &format!("     context: {}", occurrence.shown_context))?;
     }
+    for line in neighbor_lines(&occurrence.neighbors) {
+        write_line(out, &format!("     {line}"))?;
+    }
     Ok(())
 }
 
@@ -456,6 +459,44 @@ fn choose_type(out: &mut impl Write) -> Result<Option<&'static str>> {
     }
 }
 
+/// The labeled neighbor lines for a [`CensorNeighbors`], highest-signal first (`col header`,
+/// `row label`, `above`, `below`). Absent (`None`) neighbors are skipped; an empty (or whitespace-
+/// only) neighbor renders as `(empty)`. Each line is `label: previewed-text` with no leading indent —
+/// the caller prefixes it. Pure, so it is unit-tested without a TTY.
+fn neighbor_lines(neighbors: &CensorNeighbors) -> Vec<String> {
+    [
+        ("col header", &neighbors.col_header),
+        ("row label", &neighbors.row_label),
+        ("above", &neighbors.above),
+        ("below", &neighbors.below),
+    ]
+    .into_iter()
+    .filter_map(|(label, value)| {
+        value.as_ref().map(|text| {
+            let shown = preview(text);
+            let shown = if shown.is_empty() {
+                "(empty)".to_string()
+            } else {
+                shown
+            };
+            format!("{label}: {shown}")
+        })
+    })
+    .collect()
+}
+
+/// A single-line, length-capped preview of text (mirrors the styling review's preview).
+fn preview(text: &str) -> String {
+    const MAX: usize = 100;
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() > MAX {
+        let kept: String = one_line.chars().take(MAX).collect();
+        format!("{kept}\u{2026}")
+    } else {
+        one_line
+    }
+}
+
 /// Print the prompt block for one value, including its detected type, occurrence count, and the
 /// surrounding sentence so the reviewer can judge whether it is sensitive *here*.
 fn prompt(out: &mut impl Write, index: usize, total: usize, item: &ReviewItem) -> Result<()> {
@@ -473,6 +514,9 @@ fn prompt(out: &mut impl Write, index: usize, total: usize, item: &ReviewItem) -
     let shown_context = item.first_shown_context();
     if !shown_context.is_empty() {
         write_line(out, &format!("   context: {shown_context}"))?;
+    }
+    for line in neighbor_lines(&item.first_neighbors()) {
+        write_line(out, &format!("   {line}"))?;
     }
     if let Some(kinds) = mixed_kind_note(item) {
         // A value straddling block kinds is often context-dependent — nudge to split (advisory).
@@ -697,5 +741,45 @@ mod tests {
         assert_eq!(previous_groupable(1, &split), Some(0));
         assert_eq!(previous_groupable(0, &split), None);
         assert_eq!(previous_groupable(2, &[true, true]), None);
+    }
+
+    #[test]
+    fn neighbor_lines_order_skip_and_empty() {
+        let neighbors = CensorNeighbors {
+            above: Some("123 Main Street".into()),
+            below: Some(String::new()), // present but empty → (empty)
+            col_header: Some("Mailing Address".into()),
+            row_label: None, // absent → skipped
+        };
+        assert_eq!(
+            neighbor_lines(&neighbors),
+            vec![
+                "col header: Mailing Address".to_string(),
+                "above: 123 Main Street".to_string(),
+                "below: (empty)".to_string(),
+            ],
+            "highest-signal first; None skipped; empty → (empty)"
+        );
+    }
+
+    #[test]
+    fn neighbor_lines_empty_when_no_neighbors() {
+        assert!(neighbor_lines(&CensorNeighbors::default()).is_empty());
+    }
+
+    #[test]
+    fn neighbor_lines_caps_long_text() {
+        let long = "x ".repeat(200); // ~399 chars once whitespace is collapsed
+        let neighbors = CensorNeighbors {
+            above: Some(long),
+            ..Default::default()
+        };
+        let lines = neighbor_lines(&neighbors);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("above: "));
+        assert!(
+            lines[0].ends_with('\u{2026}'),
+            "a long preview is truncated with an ellipsis"
+        );
     }
 }
