@@ -13,6 +13,7 @@
 //! - [`review`] — write per-candidate censored files for cross-paragraph spans
 //! - [`style`] — read each block's formatting for the styling-review stage
 //! - [`learn`] — persist review decisions so censoring improves over time
+//! - [`ml`] — the v11 suggestive models (logistic regression over the logged records)
 //! - [`commands`] — orchestrate the above for the `review` pipeline
 #![forbid(unsafe_code)]
 
@@ -24,6 +25,7 @@ pub mod doc_id;
 pub mod extract;
 pub mod lang;
 pub mod learn;
+pub mod ml;
 pub mod model;
 pub mod pages;
 pub mod render;
@@ -51,5 +53,7 @@ pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Review(args) => commands::review::run(args),
         Command::Style(args) => commands::style::run(args),
+        Command::Train(args) => commands::train::run(args),
+        Command::Accuracy(args) => commands::accuracy::run(args),
     }
 }

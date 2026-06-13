@@ -15,6 +15,8 @@ use anyhow::{Result, bail};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, read};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
+use crate::learn::Prediction;
+use crate::ml::predict::{STYLING_LABELS, prediction_line};
 use crate::model::{DocumentStyleProfile, EffectiveRun, IndentTwips, StyledBlock};
 use crate::style::profile::{deviation_notes, positional_notes};
 
@@ -41,13 +43,17 @@ pub enum StyleVerdict {
     },
 }
 
-/// One reviewed block: its document-order index and the reviewer's verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One reviewed block: its document-order index, the reviewer's verdict, and the model's advisory
+/// prediction shown at review time (all-`None` when no model was loaded). Not `Eq`: the prediction
+/// carries floating-point scores.
+#[derive(Debug, Clone, PartialEq)]
 pub struct StyleDecision {
     /// Position of the block in document order.
     pub block_index: usize,
     /// The reviewer's verdict.
     pub verdict: StyleVerdict,
+    /// The advisory prediction the reviewer was shown for this block (for the prequential meter).
+    pub prediction: Prediction,
 }
 
 /// What a step-one keypress means during the review loop.
@@ -97,9 +103,13 @@ fn category_for_key(ch: char) -> Option<&'static str> {
 ///
 /// # Errors
 /// Returns an error if stdin is not a terminal, if raw mode cannot be toggled, or on Ctrl-C.
+/// `predictions` holds the model's advisory suggestion per block (aligned with `blocks` by
+/// position); pass an empty slice when no model is loaded, in which case no suggestion line shows and
+/// the recorded prediction is empty.
 pub fn review(
     blocks: &[StyledBlock],
     profile: &DocumentStyleProfile,
+    predictions: &[Prediction],
 ) -> Result<Vec<StyleDecision>> {
     if blocks.is_empty() {
         return Ok(Vec::new());
@@ -125,6 +135,7 @@ pub fn review(
         let block = &blocks[index];
         let peer_notes = deviation_notes(block, blocks, profile);
         let neighbor_notes = positional_notes(block, blocks);
+        let prediction = predictions.get(index).cloned().unwrap_or_default();
         prompt(
             &mut out,
             index + 1,
@@ -132,6 +143,7 @@ pub fn review(
             block,
             &peer_notes,
             &neighbor_notes,
+            &prediction,
         )?;
         match read_action()? {
             Action::Fine => {
@@ -176,10 +188,12 @@ pub fn review(
     Ok(blocks
         .iter()
         .zip(decided)
-        .filter_map(|(block, verdict)| {
+        .enumerate()
+        .filter_map(|(position, (block, verdict))| {
             verdict.map(|verdict| StyleDecision {
                 block_index: block.block_index,
                 verdict,
+                prediction: predictions.get(position).cloned().unwrap_or_default(),
             })
         })
         .collect())
@@ -278,6 +292,7 @@ fn prompt(
     block: &StyledBlock,
     peer_notes: &[String],
     neighbor_notes: &[String],
+    prediction: &Prediction,
 ) -> Result<()> {
     write_line(out, "")?;
     write_line(
@@ -302,6 +317,10 @@ fn prompt(
     }
     for line in note_lines(peer_notes, neighbor_notes) {
         write_line(out, &line)?;
+    }
+    // The advisory suggestion line, when a model produced one (additive — keys/info unchanged).
+    if let Some(line) = prediction_line(prediction, &STYLING_LABELS) {
+        write_line(out, &format!("   {line}"))?;
     }
     Ok(())
 }
@@ -537,7 +556,7 @@ mod tests {
             ilvl_indent_norms: Vec::new(),
             role_norms: Vec::new(),
         };
-        assert!(review(&[], &profile).expect("no blocks").is_empty());
+        assert!(review(&[], &profile, &[]).expect("no blocks").is_empty());
     }
 
     #[test]

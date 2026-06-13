@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     name = "stencil",
     version,
     about = "Interactively review a contract template: censor sensitive values and write a Markdown file for Claude Code, or study document styling.",
-    long_about = "Stencil has two interactive commands over a contract template:\n\n  review <doc>  — over-detect sensitive values (confirm / reject / re-type / edit / split each), then write the context-rich Markdown + per-bracket snippet files for Claude Code\n  style  <doc>  — walk every block and flag formatting that looks wrong (fix it in Word, then run `review`)\n\nTypical flow: run `style` first, fix the flagged blocks, then `review`. Both commands need an interactive terminal (TTY). IMPORTANT: censoring is a best-effort first-pass filter, NOT a guarantee of complete redaction — always review the output before sharing."
+    long_about = "Stencil has two interactive commands over a contract template, plus two that work with the models it learns:\n\n  review <doc>  — over-detect sensitive values (confirm / reject / re-type / edit / split each), then write the context-rich Markdown + per-bracket snippet files for Claude Code\n  style  <doc>  — walk every block and flag formatting that looks wrong (fix it in Word, then run `review`)\n  train         — rebuild the suggestive styling/censor models from your logged reviews (full batch)\n  accuracy      — show each model's recent (prequential) accuracy\n\nTypical flow: run `style` first, fix the flagged blocks, then `review`; run `train` once you have enough reviews and the models add an advisory green/red suggestion line (never changing the output). review/style need an interactive terminal (TTY). IMPORTANT: censoring is a best-effort first-pass filter, NOT a guarantee of complete redaction — always review the output before sharing."
 )]
 pub struct Cli {
     /// Which subcommand to run.
@@ -29,6 +29,11 @@ pub enum Command {
     /// Review document styling, surfacing formatting that looks wrong (fix it in Word, then
     /// `review`). Records the per-block fine/weird labels for the future styling model.
     Style(StyleArgs),
+    /// Rebuild the suggestive models from the logged reviews (full batch). No flags trains both;
+    /// `--styling`/`--censor` scope to one. Advisory only — never changes detection or output.
+    Train(TrainArgs),
+    /// Show each model's recent (prequential) accuracy over the last 100 logged predictions.
+    Accuracy(AccuracyArgs),
 }
 
 /// One stage of the `review` pipeline. Stages run in pipeline order (`censor` → `snippet`);
@@ -127,6 +132,48 @@ pub struct StyleArgs {
     pub styling_dir: Option<PathBuf>,
 }
 
+/// Arguments for `stencil train` — rebuild the suggestive models from the logs (v11).
+#[derive(Debug, Args)]
+pub struct TrainArgs {
+    /// Train only the styling model (default: train both).
+    #[arg(long)]
+    pub styling: bool,
+
+    /// Train only the censor model (default: train both).
+    #[arg(long)]
+    pub censor: bool,
+
+    /// Root directory for the learning stores (default: `$XDG_CONFIG_HOME/stencil` or
+    /// `~/.config/stencil`). Per-model subdirs `censor/` and `styling/` live under it.
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
+
+    /// Override the censor store location (else `<data_dir>/censor/`; env `STENCIL_CENSOR_DIR`).
+    #[arg(long)]
+    pub censor_dir: Option<PathBuf>,
+
+    /// Override the styling store location (else `<data_dir>/styling/`; env `STENCIL_STYLING_DIR`).
+    #[arg(long)]
+    pub styling_dir: Option<PathBuf>,
+}
+
+/// Arguments for `stencil accuracy` — the prequential accuracy meters (v11).
+#[derive(Debug, Args)]
+pub struct AccuracyArgs {
+    /// Root directory for the learning stores (default: `$XDG_CONFIG_HOME/stencil` or
+    /// `~/.config/stencil`).
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
+
+    /// Override the censor store location (else `<data_dir>/censor/`; env `STENCIL_CENSOR_DIR`).
+    #[arg(long)]
+    pub censor_dir: Option<PathBuf>,
+
+    /// Override the styling store location (else `<data_dir>/styling/`; env `STENCIL_STYLING_DIR`).
+    #[arg(long)]
+    pub styling_dir: Option<PathBuf>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +231,29 @@ mod tests {
             "stencil", "review", "c.docx", "--only", "censor", "--skip", "snippet",
         ]);
         assert!(result.is_err(), "--only and --skip together must error");
+    }
+
+    #[test]
+    fn parses_train_defaults_to_both_models() {
+        let cli = Cli::try_parse_from(["stencil", "train"]).expect("bare train should parse");
+        let Command::Train(args) = cli.command else {
+            panic!("expected the train subcommand");
+        };
+        // No flags ⇒ neither is set; the command treats that as "train both".
+        assert!(!args.styling);
+        assert!(!args.censor);
+    }
+
+    #[test]
+    fn parses_train_scoped_to_styling() {
+        let cli = Cli::try_parse_from(["stencil", "train", "--styling", "--data-dir", "/tmp/d"])
+            .expect("scoped train should parse");
+        let Command::Train(args) = cli.command else {
+            panic!("expected the train subcommand");
+        };
+        assert!(args.styling);
+        assert!(!args.censor);
+        assert_eq!(args.data_dir, Some(PathBuf::from("/tmp/d")));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::detect::paired_spans;
 use crate::learn::{
-    DecisionRecord, LearnedStore, block_window_at, decision_schema, sentence_window_at,
+    DecisionRecord, LearnedStore, Prediction, block_window_at, decision_schema, sentence_window_at,
 };
 use crate::model::{
     Block, BlockKind, Cell, CensorNeighbors, Document, MAPPING_VERSION, Mapping, MappingEntry,
@@ -452,6 +452,9 @@ pub struct CensorDecision {
     /// The neighbor context around the decided value (v10): for a group, the first occurrence's;
     /// for a split occurrence, that occurrence's.
     pub neighbors: CensorNeighbors,
+    /// The model's advisory prediction shown for this value at review time (v11); all-`None` when no
+    /// model ran or the value was reviewer-added (no suggestion was shown).
+    pub prediction: Prediction,
 }
 
 impl CensorDecision {
@@ -477,6 +480,7 @@ impl CensorDecision {
             context_edited: false,
             user_added: false,
             neighbors: item.first_neighbors(),
+            prediction: Prediction::default(),
         }
     }
 
@@ -513,6 +517,7 @@ impl CensorDecision {
             context_edited: false,
             user_added: false,
             neighbors,
+            prediction: Prediction::default(),
         }
     }
 
@@ -1003,6 +1008,19 @@ impl LabelAllocator {
     }
 }
 
+/// The v11 censor feature vector for a review `item`, built from the same fields the logged record
+/// carries (the label is irrelevant to the encoder, so a placeholder verdict is used). Lets the
+/// review wire a prediction before the human decides, with feature parity to what is later logged.
+pub fn item_feature_vector(item: &ReviewItem) -> Vec<f64> {
+    let decision = CensorDecision::from_item(item, Verdict::Reject, true);
+    let records = decision_records(&[decision], "", "", 0);
+    // `decision_records` keeps reviewed decisions; the one above is `reviewed: true`, so it is present.
+    records
+        .first()
+        .map(crate::ml::features::censor::censor_features)
+        .unwrap_or_default()
+}
+
 /// Build the schema-4 decision-log records for the human-reviewed decisions (auto-defaulted items
 /// are skipped). Each [`CensorDecision`] is self-contained, so no parallel `items` slice is needed.
 /// `doc_id` is the content id keying every record from this document; `source` is the filename.
@@ -1045,6 +1063,7 @@ pub fn decision_records(
                 context_edited: decision.context_edited,
                 user_added: decision.user_added,
                 neighbors: decision.neighbors.clone(),
+                prediction: decision.prediction.clone(),
             }
         })
         .collect()
@@ -1737,6 +1756,36 @@ mod tests {
         assert_eq!(records[1].verdict, "reject");
         assert_eq!(records[1].final_type, None, "reject has no final type");
         assert_eq!(records[1].detected_type, "ENTITY");
+    }
+
+    #[test]
+    fn item_feature_vector_has_the_censor_width() {
+        // The pre-decision feature vector a prediction is built from matches the encoder width.
+        let features = item_feature_vector(&item("jane@acme.com", ValueType::Email));
+        assert_eq!(
+            features.len(),
+            crate::ml::features::censor::CENSOR_FEATURE_LEN
+        );
+        assert!(features.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn decision_records_carry_the_advisory_prediction() {
+        // The prediction stamped on a decision (T67) flows onto the logged row (schema 6).
+        let mut decision = confirm_dec("a@b.com", ValueType::Email, "EMAIL");
+        decision.prediction = Prediction {
+            predicted_verdict: Some("confirm".into()),
+            predicted_verdict_score: Some(0.82),
+            predicted_reason: Some("EMAIL".into()),
+            predicted_reason_score: Some(0.6),
+            model_trained_at: Some("stamp42".into()),
+        };
+        let records = decision_records(&[decision], "c.txt", "docid", 1);
+        let prediction = &records[0].prediction;
+        assert_eq!(prediction.predicted_verdict.as_deref(), Some("confirm"));
+        assert_eq!(prediction.predicted_verdict_score, Some(0.82));
+        assert_eq!(prediction.predicted_reason.as_deref(), Some("EMAIL"));
+        assert_eq!(prediction.model_trained_at.as_deref(), Some("stamp42"));
     }
 
     #[test]

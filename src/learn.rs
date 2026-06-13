@@ -34,16 +34,18 @@ const STORE_VERSION: u32 = 1;
 /// now keyed on the reviewed value with `method`/`detected_type`/`verdict`/`final_type` (the
 /// multi-class label), replacing the schema-2 `placeholder`/`type`/`decision` fields. Schema 4
 /// (v7) adds `doc_id`, per-occurrence `block_kinds`/`heading_level`/`langs`, the decision scope,
-/// and edit provenance. Schema 5 (v10) adds the `neighbors` context. Older lines still
-/// deserialize via `#[serde(default)]`.
-const DECISION_SCHEMA: u32 = 5;
+/// and edit provenance. Schema 5 (v10) adds the `neighbors` context. Schema 6 (v11) adds the
+/// model's `prediction` (stamped before the human decides, for the prequential accuracy meter).
+/// Older lines still deserialize via `#[serde(default)]`.
+const DECISION_SCHEMA: u32 = 6;
 
 /// Schema version stamped on each `styling.jsonl` record. Schema 2 (v7) adds `doc_id` + `lang`.
 /// Schema 3 (v8) adds the per-segment `segments` breakdown (effective styling), `numbering_format`,
 /// and the `style_unresolved`/`numbering_unresolved` flags, and drops `run.mixed` (now derivable).
 /// Schema 4 (v9) enriches `context` with the neighbors' structure (each neighbor's `block_kind` +
-/// numbering); older lines still deserialize via `#[serde(default)]`.
-const STYLING_SCHEMA: u32 = 4;
+/// numbering). Schema 5 (v11) adds the model's `prediction`. Older lines still deserialize via
+/// `#[serde(default)]`.
+const STYLING_SCHEMA: u32 = 5;
 
 /// Max chars kept on each side of the placeholder when growing the sentence window — a
 /// safety net so a terminator-less run can't capture an unbounded span.
@@ -240,6 +242,33 @@ impl LearnedStore {
     }
 }
 
+/// The model's advisory prediction for one reviewed row, stamped *before* the human decides
+/// (schema 6 censor / schema 5 styling). Kept alongside the eventual verdict so accuracy can be
+/// measured **prequentially** (predict → log → decide), leak-free.
+///
+/// All-`None` means no prediction was made — a pre-v11 row, or a row reviewed with no usable model
+/// (missing/stale artifact). Such rows fall out of the accuracy window naturally and are never
+/// backfilled. `model_trained_at` echoes the artifact's `trained_at` so a row ties back to the
+/// model that produced it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Prediction {
+    /// The predicted verdict label (`fine`/`weird` or `reject`/`confirm`).
+    #[serde(default)]
+    pub predicted_verdict: Option<String>,
+    /// The verdict head's positive-class score in `0.0..=1.0`.
+    #[serde(default)]
+    pub predicted_verdict_score: Option<f64>,
+    /// The predicted reason (weird-category / value-type), when the reason head was confident.
+    #[serde(default)]
+    pub predicted_reason: Option<String>,
+    /// The reason head's top-class score.
+    #[serde(default)]
+    pub predicted_reason_score: Option<f64>,
+    /// The `trained_at` stamp of the model that produced this prediction.
+    #[serde(default)]
+    pub model_trained_at: Option<String>,
+}
+
 /// One row of the append-only censor decision log — a labeled training example for the future
 /// multi-class censor model.
 ///
@@ -249,7 +278,9 @@ impl LearnedStore {
 /// kept: `shown_context` (exactly what the reviewer saw — label provenance) and `block_context`
 /// (the richer paragraph). The log is append-only and never re-enriched. New fields carry
 /// `#[serde(default)]` so older schema-2 lines still deserialize.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Not `Eq`: the schema-6 `prediction` carries floating-point scores.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DecisionRecord {
     /// Record schema version (see [`decision_schema`]).
     pub schema: u32,
@@ -307,6 +338,9 @@ pub struct DecisionRecord {
     /// group, the first occurrence's; for a split occurrence, that occurrence's.
     #[serde(default)]
     pub neighbors: CensorNeighbors,
+    /// The model's advisory prediction for this row (schema 6); all-`None` when no model ran.
+    #[serde(default)]
+    pub prediction: Prediction,
 }
 
 /// The current decision-record schema version stamped on freshly written rows.
@@ -461,6 +495,9 @@ pub struct StylingRecord {
     pub category: Option<String>,
     /// Optional free-text note.
     pub note: Option<String>,
+    /// The model's advisory prediction for this block (schema 5); all-`None` when no model ran.
+    #[serde(default)]
+    pub prediction: Prediction,
 }
 
 /// Append one decision record to the JSONL log at `path`, creating it as needed.
@@ -745,7 +782,7 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&record).expect("serialize");
-        assert!(json.contains("\"schema\":5"));
+        assert!(json.contains("\"schema\":6"));
         assert!(json.contains("\"neighbors\":{\"above\":\"123 Main Street\""));
         assert!(json.contains("\"doc_id\":\"deadbeefcafe0001\""));
         assert!(json.contains("\"scope\":\"group\""));
@@ -819,7 +856,43 @@ mod tests {
             CensorNeighbors::default(),
             "neighbors default to all-None"
         );
-        assert_eq!(decision_schema(), 5, "fresh records stamp schema 5");
+        assert_eq!(decision_schema(), 6, "fresh records stamp schema 6");
+    }
+
+    #[test]
+    fn schema_5_decision_row_defaults_prediction_to_none() {
+        // A v10 schema-5 row predates the v11 prediction; it must still parse, with the prediction
+        // defaulting to all-`None` (no backfill).
+        let schema5 = r#"{"schema":5,"timestamp":7,"source":"c.txt","value":"Jane","method":"heuristic","detected_type":"ENTITY","verdict":"reject","shown_context":"x","block_context":"y","occurrences":1,"scope":"group","neighbors":{}}"#;
+        let rec: DecisionRecord = serde_json::from_str(schema5).expect("schema-5 still parses");
+        assert_eq!(rec.schema, 5);
+        assert_eq!(
+            rec.prediction,
+            Prediction::default(),
+            "prediction defaults to all-None"
+        );
+        assert_eq!(decision_schema(), 6, "fresh records stamp schema 6");
+    }
+
+    #[test]
+    fn decision_record_round_trips_prediction() {
+        let rec = DecisionRecord {
+            schema: decision_schema(),
+            prediction: Prediction {
+                predicted_verdict: Some("confirm".into()),
+                predicted_verdict_score: Some(0.83),
+                predicted_reason: Some("EMAIL".into()),
+                predicted_reason_score: Some(0.7),
+                model_trained_at: Some("1781257084".into()),
+            },
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&rec).expect("serialize");
+        assert!(json.contains("\"predicted_verdict\":\"confirm\""));
+        assert!(json.contains("\"model_trained_at\":\"1781257084\""));
+        let back: DecisionRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.prediction.predicted_verdict_score, Some(0.83));
+        assert_eq!(back, rec);
     }
 
     #[test]
@@ -908,9 +981,10 @@ mod tests {
             verdict: "weird".into(),
             category: Some("wrong-style-for-role".into()),
             note: Some("title as paragraph".into()),
+            prediction: Prediction::default(),
         };
         let json = serde_json::to_string(&record).expect("serialize");
-        assert!(json.contains("\"schema\":4"));
+        assert!(json.contains("\"schema\":5"));
         assert!(json.contains("\"doc_id\":\"deadbeefcafe0001\""));
         assert!(json.contains("\"lang\":\"en\""));
         assert!(json.contains("\"prev_kind\":\"list_item\""));

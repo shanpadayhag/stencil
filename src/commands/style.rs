@@ -15,8 +15,10 @@ use anyhow::{Result, bail};
 use crate::cli::StyleArgs;
 use crate::extract;
 use crate::lang;
-use crate::learn;
-use crate::model::StyledBlock;
+use crate::learn::{self, Prediction};
+use crate::ml::artifact::{self, TaskModel};
+use crate::ml::predict::{STYLING_LABELS, predict, to_prediction};
+use crate::model::{DocumentStyleProfile, StyledBlock};
 use crate::pages::PageSelection;
 use crate::style;
 use crate::style::review::{StyleVerdict, review as run_styling_review};
@@ -53,6 +55,11 @@ pub fn run(args: StyleArgs) -> Result<()> {
 
     // Profile over the whole document (accurate norms); review only the in-scope blocks.
     let profile = style::profile::build_profile(&blocks);
+
+    // Load the suggestive model once (if any) and predict each block up front; the advisory line is
+    // shown during review and the prediction is logged for the prequential meter.
+    let predictions = styling_predictions(&args, &blocks, &profile);
+
     let decisions = match &selection {
         // Scoped to `--pages`: review just those blocks. This is the only path that can be empty,
         // since the whole-document case already bailed above when there were no blocks.
@@ -66,10 +73,17 @@ pub fn run(args: StyleArgs) -> Result<()> {
                 println!("Styling: no blocks on the selected pages.");
                 return Ok(());
             }
-            run_styling_review(&reviewed, &profile)?
+            // Align the per-block predictions with the reviewed subset.
+            let scoped: Vec<Prediction> = blocks
+                .iter()
+                .zip(&predictions)
+                .filter(|(block, _)| sel.contains(block.page))
+                .map(|(_, prediction)| prediction.clone())
+                .collect();
+            run_styling_review(&reviewed, &profile, &scoped)?
         }
         // Whole document: review the blocks in place — no clone needed.
-        None => run_styling_review(&blocks, &profile)?,
+        None => run_styling_review(&blocks, &profile, &predictions)?,
     };
     let weird = decisions
         .iter()
@@ -84,6 +98,13 @@ pub fn run(args: StyleArgs) -> Result<()> {
     // The styling model trains locally and the review never edits the document, so the log keeps
     // the real block text — a faithful feature, not a lossy censored copy.
     persist_styling(&args, &blocks, &profile, &decisions, &doc_id);
+
+    // End-of-session: show the styling model's recent accuracy (best-effort; never at start).
+    if let Ok(block) =
+        super::accuracy::styling_meter_block(args.data_dir.as_deref(), args.styling_dir.as_deref())
+    {
+        println!("\n{block}");
+    }
     Ok(())
 }
 
@@ -108,6 +129,39 @@ fn parse_page_selection(args: &StyleArgs, blocks: &[StyledBlock]) -> Result<Opti
         );
     }
     Ok(Some(selection))
+}
+
+/// Load the styling model (if any) and predict every block up front, returning one [`Prediction`]
+/// per block (aligned with `blocks`). Returns an empty vec when no usable model is on disk — the
+/// review then shows no suggestion line and records an empty prediction.
+fn styling_predictions(
+    args: &StyleArgs,
+    blocks: &[StyledBlock],
+    profile: &DocumentStyleProfile,
+) -> Vec<Prediction> {
+    let Some(model) = load_styling_model(args) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(position, _)| {
+            let features = style::record::styling_feature_vector(blocks, position, profile);
+            let suggestion = predict(&model, &features);
+            to_prediction(&suggestion, &STYLING_LABELS, &model.trained_at)
+        })
+        .collect()
+}
+
+/// Load the styling `TaskModel` from its data dir, or `None` (missing / stale / unreadable).
+fn load_styling_model(args: &StyleArgs) -> Option<TaskModel> {
+    let dir = learn::model_dir(
+        learn::Model::Styling,
+        args.data_dir.as_deref(),
+        args.styling_dir.as_deref(),
+    )
+    .ok()?;
+    artifact::load(&dir.join("model.json"))
 }
 
 /// Tag each styled block with its detected language.

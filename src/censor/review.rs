@@ -16,6 +16,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, rea
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use super::{CensorDecision, ReviewItem, ValueType, Verdict, edit, locate_value};
+use crate::learn::Prediction;
+use crate::ml::predict::{CENSOR_LABELS, prediction_line};
 use crate::model::{CensorNeighbors, Document};
 
 /// The re-type menu: a key per final type the reviewer can assign. `ID` is coarse (the precise
@@ -108,7 +110,14 @@ struct EditFlags {
 ///
 /// # Errors
 /// Returns an error if stdin is not a terminal, if raw mode cannot be toggled, or on Ctrl-C.
-pub fn review(document: &Document, items: &[ReviewItem]) -> Result<Vec<CensorDecision>> {
+/// `predictions` holds the model's advisory suggestion per item (aligned with `items` by position);
+/// pass an empty slice when no model is loaded — no suggestion line shows and the recorded prediction
+/// is empty.
+pub fn review(
+    document: &Document,
+    items: &[ReviewItem],
+    predictions: &[Prediction],
+) -> Result<Vec<CensorDecision>> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
@@ -138,7 +147,8 @@ pub fn review(document: &Document, items: &[ReviewItem]) -> Result<Vec<CensorDec
 
     let mut index = 0;
     while index < total {
-        prompt(&mut out, index + 1, total, &work[index])?;
+        let prediction = predictions.get(index).cloned().unwrap_or_default();
+        prompt(&mut out, index + 1, total, &work[index], &prediction)?;
         match review_one()? {
             Action::Confirm => {
                 let label = work[index].detected_type.label().to_string();
@@ -197,7 +207,12 @@ pub fn review(document: &Document, items: &[ReviewItem]) -> Result<Vec<CensorDec
                 if work[index].occurrence_count() < 2 {
                     write_line(&mut out, "  (only one occurrence — nothing to split)")?;
                 } else if let Some(occurrence_decisions) = split_review(&mut out, &work[index])? {
-                    extra.extend(occurrence_decisions);
+                    // Each split occurrence carries the group's advisory prediction (the suggestion
+                    // the reviewer saw for the value).
+                    extra.extend(occurrence_decisions.into_iter().map(|mut decision| {
+                        decision.prediction = prediction.clone();
+                        decision
+                    }));
                     split_done[index] = true;
                     index += 1;
                 }
@@ -233,7 +248,7 @@ pub fn review(document: &Document, items: &[ReviewItem]) -> Result<Vec<CensorDec
         if split_done[index] {
             continue;
         }
-        decisions.push(decision.unwrap_or_else(|| {
+        let mut decision = decision.unwrap_or_else(|| {
             CensorDecision::from_item(
                 item,
                 Verdict::Confirm {
@@ -241,7 +256,11 @@ pub fn review(document: &Document, items: &[ReviewItem]) -> Result<Vec<CensorDec
                 },
                 false,
             )
-        }));
+        });
+        // Stamp the advisory prediction the reviewer saw (auto-defaulted items are dropped at log
+        // time, so an empty prediction on those is harmless).
+        decision.prediction = predictions.get(index).cloned().unwrap_or_default();
+        decisions.push(decision);
     }
     decisions.extend(extra);
     Ok(decisions)
@@ -499,7 +518,13 @@ fn preview(text: &str) -> String {
 
 /// Print the prompt block for one value, including its detected type, occurrence count, and the
 /// surrounding sentence so the reviewer can judge whether it is sensitive *here*.
-fn prompt(out: &mut impl Write, index: usize, total: usize, item: &ReviewItem) -> Result<()> {
+fn prompt(
+    out: &mut impl Write,
+    index: usize,
+    total: usize,
+    item: &ReviewItem,
+    prediction: &Prediction,
+) -> Result<()> {
     write_line(out, "")?;
     write_line(
         out,
@@ -524,6 +549,10 @@ fn prompt(out: &mut impl Write, index: usize, total: usize, item: &ReviewItem) -
             out,
             &format!("   \u{26a0} appears in: {kinds} — [s] to split"),
         )?;
+    }
+    // The advisory suggestion line, when a model produced one (additive — keys/info unchanged).
+    if let Some(line) = prediction_line(prediction, &CENSOR_LABELS) {
+        write_line(out, &format!("   {line}"))?;
     }
     Ok(())
 }
@@ -612,7 +641,7 @@ mod tests {
             source: std::path::PathBuf::from("t.txt"),
             blocks: Vec::new(),
         };
-        assert!(review(&doc, &[]).expect("no items").is_empty());
+        assert!(review(&doc, &[], &[]).expect("no items").is_empty());
     }
 
     fn one_occurrence_item(value: &str) -> ReviewItem {

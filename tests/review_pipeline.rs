@@ -284,6 +284,7 @@ fn styling_pipeline_writes_censored_jsonl_and_profile_sidecar() {
         StyleDecision {
             block_index: 0,
             verdict: StyleVerdict::Fine,
+            prediction: Default::default(),
         },
         StyleDecision {
             block_index: 1,
@@ -291,6 +292,7 @@ fn styling_pipeline_writes_censored_jsonl_and_profile_sidecar() {
                 category: "wrong-style-for-role".to_string(),
                 note: Some("looks off".to_string()),
             },
+            prediction: Default::default(),
         },
     ];
 
@@ -391,6 +393,7 @@ fn styling_pipeline_fires_orphan_note_and_persists_neighbor_structure() {
         StyleDecision {
             block_index: 0,
             verdict: StyleVerdict::Fine,
+            prediction: Default::default(),
         },
         StyleDecision {
             block_index: 1,
@@ -398,10 +401,12 @@ fn styling_pipeline_fires_orphan_note_and_persists_neighbor_structure() {
                 category: "wrong-style-for-role".to_string(),
                 note: Some("orphaned list item".to_string()),
             },
+            prediction: Default::default(),
         },
         StyleDecision {
             block_index: 2,
             verdict: StyleVerdict::Fine,
+            prediction: Default::default(),
         },
     ];
 

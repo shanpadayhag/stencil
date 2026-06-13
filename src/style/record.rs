@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::learn::{
-    self, Indent, NeighborContext, Numbering, ParaStyle, RelativeStyle, RunStyle, StylingRecord,
+    self, Indent, NeighborContext, Numbering, ParaStyle, Prediction, RelativeStyle, RunStyle,
+    StylingRecord,
 };
 use crate::model::{BlockKind, DocumentStyleProfile, RelativeFeatures, StyledBlock};
 use crate::style::review::{StyleDecision, StyleVerdict};
@@ -28,6 +29,7 @@ pub fn build_record(
     source: &str,
     doc_id: &str,
     verdict: &StyleVerdict,
+    prediction: &Prediction,
 ) -> StylingRecord {
     let (verdict_label, category, note) = match verdict {
         StyleVerdict::Fine => ("fine", None, None),
@@ -56,7 +58,32 @@ pub fn build_record(
         verdict: verdict_label.to_string(),
         category,
         note,
+        prediction: prediction.clone(),
     }
+}
+
+/// The v11 styling feature vector for the block at `position` in `blocks`, built from the same
+/// relative + neighbor features the logged record carries (the label is irrelevant to the encoder,
+/// so a placeholder verdict/prediction is used). Lets the review wire a prediction before the human
+/// decides, with feature parity to what is later logged.
+pub fn styling_feature_vector(
+    blocks: &[StyledBlock],
+    position: usize,
+    profile: &DocumentStyleProfile,
+) -> Vec<f64> {
+    let block = &blocks[position];
+    let relative = crate::style::profile::relative_features(block, profile);
+    let context = neighbor_context(blocks, position);
+    let record = build_record(
+        block,
+        &relative,
+        context,
+        "",
+        "",
+        &StyleVerdict::Fine,
+        &Prediction::default(),
+    );
+    crate::ml::features::styling::styling_features(&record)
 }
 
 /// The text and structure of the blocks immediately before and after `index`, in document order.
@@ -132,6 +159,7 @@ pub fn persist(
             &source_label,
             doc_id,
             &decision.verdict,
+            &decision.prediction,
         );
         learn::append_styling(log_path, &record)?;
     }
@@ -246,6 +274,7 @@ mod tests {
             "c.docx",
             "doc-id-test",
             &StyleVerdict::Fine,
+            &Prediction::default(),
         );
         assert_eq!(record.verdict, "fine");
         assert_eq!(record.category, None);
@@ -301,6 +330,7 @@ mod tests {
                 category: "wrong-style-for-role".into(),
                 note: Some("title as paragraph".into()),
             },
+            &Prediction::default(),
         );
 
         assert_eq!(record.verdict, "weird");
@@ -338,6 +368,7 @@ mod tests {
             "c.docx",
             "doc-id-test",
             &StyleVerdict::Fine,
+            &Prediction::default(),
         );
         assert_eq!(record.para.numbering, None);
     }
@@ -447,9 +478,11 @@ mod tests {
             StyleDecision {
                 block_index: 0,
                 verdict: StyleVerdict::Fine,
+                prediction: Prediction::default(),
             },
             StyleDecision {
                 block_index: 1,
+                prediction: Prediction::default(),
                 verdict: StyleVerdict::Weird {
                     category: "other".into(),
                     note: None,
@@ -484,6 +517,66 @@ mod tests {
         let back: DocumentStyleProfile =
             serde_json::from_str(&sidecar_json).expect("parse profile");
         assert_eq!(back, profile);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_record_carries_the_advisory_prediction() {
+        // The prediction stamped on a decision (T67) flows onto the logged row (schema 5).
+        let dir = std::env::temp_dir().join(format!("stencil_t67_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log_path = dir.join("styling.jsonl");
+        let profiles_dir = dir.join("profiles");
+        let blocks = [block(
+            0,
+            "x",
+            ModelParaStyle::default(),
+            ModelRunStyle::default(),
+        )];
+        let profile = build_profile(&blocks);
+        let decisions = vec![StyleDecision {
+            block_index: 0,
+            verdict: StyleVerdict::Weird {
+                category: "fake-number".into(),
+                note: None,
+            },
+            prediction: Prediction {
+                predicted_verdict: Some("weird".into()),
+                predicted_verdict_score: Some(0.91),
+                predicted_reason: Some("fake-number".into()),
+                predicted_reason_score: Some(0.7),
+                model_trained_at: Some("stamp9".into()),
+            },
+        }];
+
+        persist(
+            &log_path,
+            &profiles_dir,
+            &blocks,
+            &profile,
+            &decisions,
+            Path::new("c.docx"),
+            "docid",
+        )
+        .expect("persist");
+
+        let log = std::fs::read_to_string(&log_path).expect("read log");
+        let record: StylingRecord =
+            serde_json::from_str(log.lines().next().expect("a row")).expect("parse record");
+        assert_eq!(
+            record.prediction.predicted_verdict.as_deref(),
+            Some("weird")
+        );
+        assert_eq!(record.prediction.predicted_verdict_score, Some(0.91));
+        assert_eq!(
+            record.prediction.predicted_reason.as_deref(),
+            Some("fake-number")
+        );
+        assert_eq!(
+            record.prediction.model_trained_at.as_deref(),
+            Some("stamp9")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

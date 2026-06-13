@@ -22,7 +22,9 @@ use crate::censor::{self, CensorDecision, CensorOptions, PartyList, Verdict};
 use crate::cli::{ReviewArgs, Stage};
 use crate::detect::{Detection, Status, detect};
 use crate::extract;
-use crate::learn::{self, LearnedStore};
+use crate::learn::{self, LearnedStore, Prediction};
+use crate::ml::artifact::{self, TaskModel};
+use crate::ml::predict::{CENSOR_LABELS, predict, to_prediction};
 use crate::model::Document;
 use crate::pages::PageSelection;
 use crate::render::{SnippetEntry, render};
@@ -168,7 +170,10 @@ fn run_censor_stage(
     // `--pages`: review only values on the selected pages; the rest are auto-censored (kept
     // confirmed for safety, but `reviewed: false` so they are not logged as human labels).
     let (reviewed_items, out_of_scope) = scope_items(items, page_scope);
-    let mut decisions = run_censor_review(extracted, &reviewed_items)?;
+    // Load the suggestive model once (if any) and predict each value before review; the advisory
+    // line is shown and the prediction is logged for the prequential meter.
+    let predictions = censor_predictions(args, &reviewed_items);
+    let mut decisions = run_censor_review(extracted, &reviewed_items, &predictions)?;
     if !out_of_scope.is_empty() {
         println!(
             "Censor: {} value(s) on other pages auto-censored (not reviewed).",
@@ -215,7 +220,42 @@ fn run_censor_stage(
 
     let source = extracted.source.display().to_string();
     persist_decisions(args, &decisions, &source, doc_id);
+
+    // End-of-session: show the censor model's recent accuracy (best-effort; never at start).
+    if let Ok(block) =
+        super::accuracy::censor_meter_block(args.data_dir.as_deref(), args.censor_dir.as_deref())
+    {
+        println!("\n{block}");
+    }
     Ok((working, rejected))
+}
+
+/// Load the censor model (if any) and predict each review item up front, returning one
+/// [`Prediction`] per item (aligned with `items`). Empty when no usable model is on disk — the
+/// review then shows no suggestion line and records an empty prediction.
+fn censor_predictions(args: &ReviewArgs, items: &[censor::ReviewItem]) -> Vec<Prediction> {
+    let Some(model) = load_censor_model(args) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|item| {
+            let features = censor::item_feature_vector(item);
+            let suggestion = predict(&model, &features);
+            to_prediction(&suggestion, &CENSOR_LABELS, &model.trained_at)
+        })
+        .collect()
+}
+
+/// Load the censor `TaskModel` from its data dir, or `None` (missing / stale / unreadable).
+fn load_censor_model(args: &ReviewArgs) -> Option<TaskModel> {
+    let dir = learn::model_dir(
+        learn::Model::Censor,
+        args.data_dir.as_deref(),
+        args.censor_dir.as_deref(),
+    )
+    .ok()?;
+    artifact::load(&dir.join("model.json"))
 }
 
 /// Load the per-user learned allowlist (censor store), or an empty set if it cannot be read.

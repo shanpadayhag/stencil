@@ -79,6 +79,33 @@ so you can spot issues without the tool passing judgment. It **never edits the d
 flagged blocks yourself in Word, then run `review`. The per-block labels are recorded as training data
 for a future "should this fix be applied?" model.
 
+### `train` / `accuracy` — the suggestive models
+
+Stencil learns from your reviews. Once you have logged enough decisions, `train` builds two
+interpretable, class-aware **logistic-regression** models — one for styling (`fine` vs `weird`), one
+for censoring (`reject` vs `confirm`) — each also predicting a *reason* (the weird-category / the
+value type):
+
+```sh
+stencil train                 # rebuild both models from the logs (full batch)
+stencil train --censor        # just the censor model (or --styling)
+stencil accuracy              # how accurate each model has recently been
+```
+
+After a model exists, each `review` / `style` item shows one extra **suggestion** line — green when
+the model expects you to keep it (`fine` / leave-in-clear), red when it expects a flag (`weird` /
+`censor`, with the predicted reason). It is **advisory only**: the suggestion never changes detection,
+censoring, restyling, or the delivered document — the model suggests, you decide. If no model is
+trained yet (or it predates a feature change), no line shows and the review behaves exactly as before.
+
+`accuracy` (and the summary printed at the end of each `review` / `style` session) reports
+**prequential** accuracy — every suggestion is logged *before* you decide, so the score is leak-free.
+The headline is **balanced accuracy** over the last 100 predictions (the mean of the per-class hit
+rates, so a model that just predicts the common class can't look good), with per-class counts and a
+separate reason figure. Below 100 predictions, or with too few of the rare class, it shows honest
+counts and "not enough data yet" instead of a percentage. Training is manual and full-batch — no
+automatic or background retraining, and the new model is swapped in atomically.
+
 ### Flags
 
 Shared by both commands:
@@ -103,6 +130,11 @@ Shared by both commands:
 
 - `--styling-dir <dir>` — override the styling store location (env `STENCIL_STYLING_DIR`).
 
+`train` / `accuracy`:
+
+- `--styling` / `--censor` (train only) — scope to one model; default trains both.
+- `--data-dir` / `--censor-dir` / `--styling-dir` — same store locations as above.
+
 ## How it works
 
 ```
@@ -123,10 +155,13 @@ corrected.docx → extract → censor (confirm/edit/split/add) → snippet ─�
   never leaks into a snippet.
 - **Stable document id.** Records and the style profile are keyed by a content hash (`doc_id`), not
   the filename, so reusing one filename across folders never collides.
-- **Deterministic learning.** Your censor decisions feed a per-user store: a value you reject
-  becomes an auto-skip on later runs; a value seen both ways stays censored. The append-only
-  `decisions.jsonl` and `styling.jsonl` logs — tagged with block kind, language, and edit
-  provenance — are the labelled training sets for future models.
+- **Deterministic learning + suggestive models.** Your censor decisions feed a per-user store: a
+  value you reject becomes an auto-skip on later runs; a value seen both ways stays censored. The
+  append-only `decisions.jsonl` and `styling.jsonl` logs — tagged with block kind, language, and edit
+  provenance — are the labelled training sets for the `train`/`accuracy` models. Those models are
+  **advisory only**: they add a suggestion line and an accuracy meter, and never alter detection,
+  censoring, or the output. Everything stays local and per-user — no shared model, no telemetry, no
+  network.
 - **Detection is lenient.** Lone (unpaired) brackets are still detected and flagged *guessed* for
   review, with a `[`/`]` balance diagnostic.
 
